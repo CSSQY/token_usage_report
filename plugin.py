@@ -1,0 +1,442 @@
+"""Token 用量统计与播报插件入口。
+
+提供三块能力：
+1. ``query_token_usage`` 工具：供 LLM 查询全局或会话维度的 Token 消耗；
+2. ``/token`` 指令：在指令来源处回复统计结果（支持 all / 群 / 用户）；
+3. 每日定时播报：按配置时刻向指定 QQ 群 / QQ 号推送统计报告。
+"""
+
+from datetime import datetime, time as datetime_time, timedelta
+from typing import Any, Dict, List, Optional, Tuple
+
+import asyncio
+import contextlib
+import logging
+
+from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, Command, MaiBotPlugin, Tool
+from maibot_sdk.types import ToolParameterInfo, ToolParamType
+
+from .config_model import TokenUsageReportConfig
+from .data_sources import collect_global_metrics
+from .delivery import broadcast_report, describe_targets, send_report
+from .metrics import WINDOW_ORDER, ReportMetrics
+from .renderer import build_report_image
+from .session_stats import SessionStatsError, collect_session_metrics
+from .text_report import build_report_text, build_short_window_text, render_text_report
+
+logger = logging.getLogger(__name__)
+
+_VALID_SCOPES = ("all", "current", "group", "user")
+_SCOPE_ALIASES = {"全": "all", "全部": "all", "当前": "current", "群": "group", "用户": "user"}
+_USAGE_TEXT = "用法：/token（当前对话）、/token all（全部会话）、/token 群 <群号>、/token 用户 <QQ号>"
+_IDLE_WAIT_SECONDS = 60.0
+
+
+class TokenUsageReportPlugin(MaiBotPlugin):
+    """Token 用量统计与播报插件。"""
+
+    config_model = TokenUsageReportConfig
+
+    def __init__(self) -> None:
+        """初始化插件实例与内部任务状态。"""
+
+        super().__init__()
+        self._scheduler_task: Optional[asyncio.Task[None]] = None
+        self._reload_event: Optional[asyncio.Event] = None
+        self._logged_invalid_times: set[str] = set()
+
+    # ──── 生命周期 ────
+
+    async def on_load(self) -> None:
+        """插件加载：启动每日定时播报循环。"""
+
+        self._reload_event = asyncio.Event()
+        self._scheduler_task = asyncio.create_task(self._schedule_loop())
+        logger.info("[token_usage_report] 插件已加载，定时播报循环已启动（enabled=%s）", self.config.report.enabled)
+
+    async def on_unload(self) -> None:
+        """插件卸载：停止定时播报循环。"""
+
+        if self._scheduler_task is not None:
+            self._scheduler_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._scheduler_task
+            self._scheduler_task = None
+        logger.info("[token_usage_report] 插件已卸载，定时播报循环已停止")
+
+    async def on_config_update(self, scope: str, config_data: Dict[str, object], version: str) -> None:
+        """处理配置热更新。
+
+        Args:
+            scope: 配置变更范围。
+            config_data: 最新配置数据。
+            version: 配置版本号。
+        """
+
+        del config_data
+        if scope != CONFIG_RELOAD_SCOPE_SELF:
+            return
+        self._logged_invalid_times.clear()
+        if self._reload_event is not None:
+            self._reload_event.set()
+        logger.info("[token_usage_report] 插件配置已更新（version=%s），定时任务将按新配置重算", version)
+
+    # ──── LLM 工具 ────
+
+    @Tool(
+        "query_token_usage",
+        description=(
+            "查询 Bot 自身消耗的 token 用量。scope 可选：all=全部会话（默认）、current=当前对话"
+            "（需传 stream_id）、group=指定群聊（需传 target_id 群号）、user=指定用户（需传 target_id QQ 号）；"
+            "window 可选 today/this_week/this_month/last_24h/last_7d/last_30d，留空返回全部窗口。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="scope",
+                param_type=ToolParamType.STRING,
+                description="统计范围：all / current / group / user",
+                required=False,
+                default="all",
+            ),
+            ToolParameterInfo(
+                name="target_id",
+                param_type=ToolParamType.STRING,
+                description="scope=group 时的群号，scope=user 时的 QQ 号",
+                required=False,
+                default="",
+            ),
+            ToolParameterInfo(
+                name="stream_id",
+                param_type=ToolParamType.STRING,
+                description="scope=current 时必填，当前聊天流 ID",
+                required=False,
+                default="",
+            ),
+            ToolParameterInfo(
+                name="window",
+                param_type=ToolParamType.STRING,
+                description="时间窗口，留空返回全部窗口",
+                required=False,
+                default="",
+            ),
+        ],
+    )
+    async def handle_query_token_usage(
+        self,
+        scope: str = "all",
+        target_id: str = "",
+        stream_id: str = "",
+        window: str = "",
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """查询 Token 用量并返回给 LLM。"""
+
+        del kwargs
+        normalized_scope = str(scope or "all").strip().lower() or "all"
+        if normalized_scope not in _VALID_SCOPES:
+            return {"success": False, "content": f"不支持的统计范围：{scope}（可选 {'/'.join(_VALID_SCOPES)}）"}
+
+        window_key = str(window or "").strip().lower()
+        if window_key and window_key != "all" and window_key not in WINDOW_ORDER:
+            return {"success": False, "content": f"不支持的时间范围：{window}（可选 {', '.join(WINDOW_ORDER)}）"}
+
+        try:
+            metrics = await self._collect_metrics(
+                scope=normalized_scope,
+                stream_id=stream_id,
+                target_id=target_id,
+            )
+        except SessionStatsError as exc:
+            return {"success": False, "content": str(exc)}
+        except Exception as exc:
+            logger.error("[token_usage_report] 工具统计失败：%s", exc, exc_info=True)
+            return {"success": False, "content": f"统计失败：{exc}"}
+
+        return {
+            "success": True,
+            "content": build_short_window_text(metrics, window_key or "all"),
+            "scope": metrics.scope,
+            "scope_name": metrics.scope_name,
+            "unit_name": metrics.unit_name,
+            "windows": {
+                window_item.key: {"tokens": window_item.tokens, "requests": window_item.requests, "cost": window_item.cost}
+                for window_item in metrics.ordered_windows()
+            },
+            "total": None
+            if metrics.total is None
+            else {
+                "tokens": metrics.total.tokens,
+                "requests": metrics.total.requests,
+                "cost": metrics.total.cost,
+                "cache_hit_tokens": metrics.total.cache_hit_tokens,
+                "cache_miss_tokens": metrics.total.cache_miss_tokens,
+            },
+            "unavailable": sorted(set(metrics.unavailable)),
+        }
+
+    # ──── 指令 ────
+
+    @Command(
+        "token_usage",
+        description="统计 Bot 的 Token 消耗（当前对话 / 全部 / 指定群 / 指定用户）",
+        pattern=r"^/(?:token|tokens)(?:\s+(?P<arg1>\S+))?(?:\s+(?P<arg2>\S+))?$",
+    )
+    async def handle_token_command(
+        self,
+        stream_id: str = "",
+        group_id: str = "",
+        user_id: str = "",
+        is_local_operator: bool = False,
+        **kwargs: Any,
+    ) -> Tuple[bool, str, bool]:
+        """处理 ``/token`` 指令。"""
+
+        if not self.config.command.enabled:
+            return False, "统计指令已禁用", True
+
+        if not self._check_command_permission(
+            group_id=group_id,
+            user_id=user_id,
+            is_local_operator=bool(is_local_operator),
+        ):
+            deny_message = str(self.config.command.deny_message or "").strip()
+            if deny_message:
+                await self.ctx.send.text(deny_message, stream_id)
+            return True, "无权限", True
+
+        scope, target_id, error_message = self._parse_command_args(kwargs)
+        if error_message:
+            await self.ctx.send.text(error_message, stream_id)
+            return False, error_message, True
+
+        try:
+            metrics = await self._collect_metrics(scope=scope, stream_id=stream_id, target_id=target_id)
+        except SessionStatsError as exc:
+            await self.ctx.send.text(str(exc), stream_id)
+            return False, str(exc), True
+        except Exception as exc:
+            logger.error("[token_usage_report] 指令统计失败：%s", exc, exc_info=True)
+            failure_text = f"统计失败：{exc}"
+            await self.ctx.send.text(failure_text, stream_id)
+            return False, failure_text, True
+
+        text_report = render_text_report(metrics, self.config)
+        image_base64: Optional[str] = None
+        if self.config.command.use_image:
+            image_base64, render_error = await build_report_image(self.ctx, metrics, self.config)
+            if image_base64 is None:
+                logger.error("[token_usage_report] 指令图片渲染失败，已回退为文字版本：%s", render_error)
+
+        sent = await send_report(self.ctx, stream_id, text_report, image_base64)
+        if not sent:
+            return False, "统计结果发送失败", True
+        return True, "已发送 Token 统计", True
+
+    def _parse_command_args(self, kwargs: Dict[str, Any]) -> Tuple[str, str, str]:
+        """解析指令参数，返回 ``(scope, target_id, 错误提示)``。"""
+
+        matched_groups = kwargs.get("matched_groups")
+        arg1 = ""
+        arg2 = ""
+        if isinstance(matched_groups, dict):
+            arg1 = str(matched_groups.get("arg1") or "").strip()
+            arg2 = str(matched_groups.get("arg2") or "").strip()
+        if not arg1:
+            raw_text = str(kwargs.get("text") or "").strip()
+            parts = raw_text.split()
+            if len(parts) >= 2:
+                arg1 = parts[1]
+            if len(parts) >= 3:
+                arg2 = parts[2]
+
+        if not arg1:
+            return "current", "", ""
+        normalized_arg = _SCOPE_ALIASES.get(arg1.lower(), _SCOPE_ALIASES.get(arg1, arg1.lower()))
+        if normalized_arg == "all":
+            return "all", "", ""
+        if normalized_arg in {"group", "user"}:
+            if not arg2:
+                return "", "", f"缺少目标：{_USAGE_TEXT}"
+            return normalized_arg, arg2, ""
+        return "", "", f"无法识别的参数「{arg1}」。{_USAGE_TEXT}"
+
+    def _check_command_permission(self, *, group_id: str, user_id: str, is_local_operator: bool) -> bool:
+        """按配置判断指令调用者是否有权限。
+
+        判定顺序：
+        1. 本地调试终端（local operator）始终放行；
+        2. 用户黑名单：命中的用户**始终拒绝**（最高优先级，冲突时优先于用户白名单）；
+        3. 用户白名单：命中的用户**始终放行**（优先于群名单）；
+        4. 群黑名单：命中的群在任何模式下都**拒绝**（冲突时优先于群白名单）；
+        5. ``all`` 模式：不启用群白名单，直接放行；
+        6. ``whitelist`` 模式：群聊要求群在白名单内；
+        7. ``blacklist`` 模式：群聊未命中群黑名单即放行（步骤 4 已处理命中情况）。
+
+        说明：私聊没有群可判定，只能依赖用户名单，因此 ``whitelist`` 模式下
+        未列入用户白名单的私聊会被拒绝。
+        """
+
+        if is_local_operator:
+            return True
+
+        command_config = self.config.command
+        normalized_group_id = str(group_id or "").strip()
+        normalized_user_id = str(user_id or "").strip()
+        is_group_chat = bool(normalized_group_id)
+
+        # 用户名单是绝对规则：黑名单优先于白名单
+        if normalized_user_id and normalized_user_id in command_config.blacklist_users:
+            return False
+        if normalized_user_id and normalized_user_id in command_config.whitelist_users:
+            return True
+
+        # 群黑名单优先于群白名单，且不区分名单制度
+        if is_group_chat and normalized_group_id in command_config.blacklist_groups:
+            return False
+
+        if command_config.permission_mode == "all":
+            return True
+        if not is_group_chat:
+            return command_config.permission_mode != "whitelist"
+        if command_config.permission_mode == "whitelist":
+            return normalized_group_id in command_config.whitelist_groups
+        return True
+
+    # ──── 定时播报 ────
+
+    async def _schedule_loop(self) -> None:
+        """每日定时播报循环：漏过的时刻不补发，失败不重试。"""
+
+        while True:
+            try:
+                wait_seconds = self._seconds_until_next_run()
+                if wait_seconds is None:
+                    await self._wait_or_reload(_IDLE_WAIT_SECONDS)
+                    continue
+                await self._wait_or_reload(wait_seconds)
+                if self._reload_event is not None and self._reload_event.is_set():
+                    self._reload_event.clear()
+                    continue
+                await self._run_scheduled_report()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("[token_usage_report] 定时播报执行失败（本次不重试）：%s", exc, exc_info=True)
+                await self._wait_or_reload(_IDLE_WAIT_SECONDS)
+
+    async def _wait_or_reload(self, seconds: float) -> None:
+        """等待指定秒数，或被配置更新事件提前唤醒。"""
+
+        if self._reload_event is None:
+            await asyncio.sleep(max(seconds, 0.0))
+            return
+        reload_task = asyncio.create_task(self._reload_event.wait())
+        try:
+            await asyncio.wait({reload_task}, timeout=max(seconds, 0.0))
+        finally:
+            reload_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await reload_task
+
+    def _seconds_until_next_run(self) -> Optional[float]:
+        """计算距离下一个播报时刻的秒数；未启用或时刻非法时返回 None。"""
+
+        report_config = self.config.report
+        if not report_config.enabled:
+            return None
+
+        now = datetime.now()
+        valid_times: List[datetime_time] = []
+        for raw_time in report_config.schedule_times:
+            parsed_time = _parse_schedule_time(raw_time)
+            if parsed_time is None:
+                if raw_time not in self._logged_invalid_times:
+                    self._logged_invalid_times.add(raw_time)
+                    logger.warning("[token_usage_report] 播报时刻格式非法，已忽略：%s（应为 HH:MM）", raw_time)
+                continue
+            valid_times.append(parsed_time)
+        if not valid_times:
+            if not self._logged_invalid_times:
+                self._logged_invalid_times.add("<empty>")
+                logger.warning("[token_usage_report] 定时播报已启用，但没有可用的发送时刻，已跳过")
+            return None
+
+        today_candidates = [
+            now.replace(hour=item.hour, minute=item.minute, second=0, microsecond=0)
+            for item in valid_times
+            if now.replace(hour=item.hour, minute=item.minute, second=0, microsecond=0) > now
+        ]
+        next_run = min(today_candidates) if today_candidates else (
+            datetime.combine(now.date() + timedelta(days=1), min(valid_times))
+        )
+        return max((next_run - now).total_seconds(), 0.0)
+
+    async def _run_scheduled_report(self) -> None:
+        """执行一次定时播报。"""
+
+        if not describe_targets(self.config):
+            logger.warning("[token_usage_report] 定时播报已启用但未配置任何目标群/用户，本次跳过")
+            return
+
+        metrics = await collect_global_metrics(self.ctx, self.config)
+        text_report = await build_report_text(self.ctx, metrics, self.config)
+        image_base64: Optional[str] = None
+        if self.config.report.send_image:
+            image_base64, render_error = await build_report_image(self.ctx, metrics, self.config)
+            if image_base64 is None:
+                logger.error("[token_usage_report] 播报图片渲染失败，已回退为文字版本：%s", render_error)
+
+        success_count, failure_count = await broadcast_report(self.ctx, self.config, text_report, image_base64)
+        logger.info("[token_usage_report] 定时播报完成：成功 %d 个目标，失败 %d 个目标", success_count, failure_count)
+
+    # ──── 共用 ────
+
+    async def _collect_metrics(self, *, scope: str, stream_id: str = "", target_id: str = "") -> ReportMetrics:
+        """按统计范围采集指标。"""
+
+        if scope == "all":
+            return await collect_global_metrics(self.ctx, self.config)
+        return await collect_session_metrics(
+            self.ctx,
+            self.config,
+            scope=scope,
+            stream_id=stream_id,
+            target_id=target_id,
+            platform=self.config.report.platform,
+        )
+
+
+def _parse_schedule_time(raw_value: object) -> Optional[datetime_time]:
+    """解析 ``HH:MM`` 格式的播报时刻。
+
+    Args:
+        raw_value: 配置中的时刻文本。
+
+    Returns:
+        Optional[datetime_time]: 解析成功时返回时间对象，否则返回 None。
+    """
+
+    text = str(raw_value or "").strip()
+    if not text:
+        return None
+    parts = text.split(":")
+    if len(parts) != 2:
+        return None
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+    except ValueError:
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return datetime_time(hour=hour, minute=minute)
+
+
+def create_plugin() -> TokenUsageReportPlugin:
+    """创建插件实例。
+
+    Returns:
+        TokenUsageReportPlugin: 新的插件实例。
+    """
+
+    return TokenUsageReportPlugin()

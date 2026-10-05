@@ -1,0 +1,8 @@
+# 运行时依赖（宿主环境已自带，此处仅供本地开发与静态检查使用）
+pillow>=12.3.0
+
+# 说明：
+# - maibot-plugin-sdk 由 MaiBot 宿主提供（宿主 pyproject.toml 依赖 maibot-plugin-sdk>=2.9.0），
+#   本插件不在此声明，避免被工具误升级或降级宿主 SDK。
+# - 除 Pillow 外无任何第三方依赖；宿主依赖安装管线只读取 _manifest.json 的 dependencies，
+#   不会读取本文件。
