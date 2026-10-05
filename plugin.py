@@ -107,8 +107,9 @@ class TokenUsageReportPlugin(MaiBotPlugin):
     @Tool(
         "query_token_usage",
         description=(
-            "查询 Bot 自身消耗的 token 用量。scope 可选：all=全部会话（默认）、current=当前对话"
-            "（需传 stream_id）、group=指定群聊（需传 target_id 群号）、user=指定用户（需传 target_id QQ 号）；"
+            "查询 Bot 自身消耗的 token 用量（受与 /token 指令相同的黑白名单限制，且只能查询「工具可查询范围」"
+            "里允许的范围，默认只允许当前对话）。scope 可选：current=当前对话（默认，取本次调用的会话上下文）、"
+            "all=全部会话、group=指定群聊（需传 target_id 群号）、user=指定用户（需传 target_id QQ 号）；"
             f"window 可选 {WINDOW_USAGE_HINT}（也支持 today/this_week/this_month/last_24h/last_7d/last_30d），"
             "留空返回全部窗口。"
         ),
@@ -116,21 +117,14 @@ class TokenUsageReportPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="scope",
                 param_type=ToolParamType.STRING,
-                description="统计范围：all / current / group / user",
+                description="统计范围：current / all / group / user",
                 required=False,
-                default="all",
+                default="current",
             ),
             ToolParameterInfo(
                 name="target_id",
                 param_type=ToolParamType.STRING,
                 description="scope=group 时的群号，scope=user 时的 QQ 号",
-                required=False,
-                default="",
-            ),
-            ToolParameterInfo(
-                name="stream_id",
-                param_type=ToolParamType.STRING,
-                description="scope=current 时必填，当前聊天流 ID",
                 required=False,
                 default="",
             ),
@@ -145,18 +139,51 @@ class TokenUsageReportPlugin(MaiBotPlugin):
     )
     async def handle_query_token_usage(
         self,
-        scope: str = "all",
+        scope: str = "current",
         target_id: str = "",
         stream_id: str = "",
         window: str = "",
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """查询 Token 用量并返回给 LLM。"""
+        """查询 Token 用量并返回给 LLM。
 
-        del kwargs
-        normalized_scope = str(scope or "all").strip().lower() or "all"
+        权限与范围收口（工具由模型调用、调用者不会看到指令帮助，因此这里必须自己拦）：
+        1. 复用 ``/token`` 的同一套黑白名单（调用上下文里的 group_id / user_id）；
+        2. 只允许查询 ``command.tool_allowed_scopes`` 里列出的范围（默认仅 current），
+           避免模型替任意人把全局账本或别的群的数据取回来。
+        """
+
+        normalized_scope = str(scope or "current").strip().lower() or "current"
         if normalized_scope not in _VALID_SCOPES:
             return {"success": False, "content": f"不支持的统计范围：{scope}（可选 {'/'.join(_VALID_SCOPES)}）"}
+
+        if not self._check_command_permission(
+            group_id=str(kwargs.get("group_id") or ""),
+            user_id=str(kwargs.get("user_id") or ""),
+            is_local_operator=False,
+        ):
+            logger.info(
+                "[token_usage_report] 工具调用被权限拦下：group=%s user=%s scope=%s",
+                kwargs.get("group_id"),
+                kwargs.get("user_id"),
+                normalized_scope,
+            )
+            return {"success": False, "content": "当前会话没有查询 Token 用量的权限（与 /token 同一套黑白名单）"}
+
+        allowed_scopes = _normalize_scope_list(self.config.command.tool_allowed_scopes)
+        if normalized_scope not in allowed_scopes:
+            logger.info(
+                "[token_usage_report] 工具调用超出允许范围：scope=%s，允许=%s",
+                normalized_scope,
+                sorted(allowed_scopes) or "（空，已全部禁止）",
+            )
+            return {
+                "success": False,
+                "content": (
+                    f"不允许通过工具查询「{normalized_scope}」范围"
+                    "（可查询范围由插件配置「工具可查询范围」决定；需要全局统计请让管理员使用 /token 指令）"
+                ),
+            }
 
         window_key = str(window or "").strip().lower()
         if window_key and window_key != "all":
@@ -524,6 +551,31 @@ class TokenUsageReportPlugin(MaiBotPlugin):
             platform=self.config.report.platform,
             window_key=window_key,
         )
+
+
+def _normalize_scope_list(raw_scopes: Any) -> set[str]:
+    """把配置里的「工具可查询范围」规范化为范围集合。
+
+    支持填英文范围名，也支持「全 / 全部 / 群 / 用户」等写法；无法识别的条目会被忽略。
+
+    Args:
+        raw_scopes: 配置中的范围条目列表。
+
+    Returns:
+        set[str]: 规范化后的范围集合。
+    """
+
+    normalized: set[str] = set()
+    for raw_item in raw_scopes or []:
+        item = str(raw_item or "").strip()
+        if not item:
+            continue
+        mapped = _SCOPE_ALIASES.get(item.lower(), _SCOPE_ALIASES.get(item, item.lower()))
+        if mapped in _VALID_SCOPES:
+            normalized.add(mapped)
+            continue
+        logger.warning("[token_usage_report] 「工具可查询范围」里的条目无法识别，已忽略：%s", item)
+    return normalized
 
 
 def _parse_schedule_time(raw_value: object) -> Optional[datetime_time]:

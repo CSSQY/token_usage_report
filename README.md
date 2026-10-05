@@ -1,5 +1,4 @@
 # Token 用量统计与播报（MaiBot 插件）
-> 本插件由AI主导开发完成
 
 一个只依赖 MaiBot 宿主能力的统计插件：统计 Bot 自身消耗的 Token，支持**会话维度筛选**、**图片报告**、**每日定时播报**与 **LLM 风格化转述**。
 
@@ -14,7 +13,7 @@
 - **`/token` 指令**：立即统计并在指令来源处回复（哪里发的返回哪里），支持 `all`、`群 <群号>`、`用户 <QQ号>`。
 - **每日定时播报**：按配置的多个每日时刻，向多个 QQ 群 / QQ 号推送报告；漏过的时刻不补发、执行失败不重试（仅记一次日志）。
 - **两种呈现**：自定义文本模板（占位符）或 LLM 风格化转述（**复用宿主已分配的模型组**，并自动注入宿主人格与表达风格）。
-- **图片报告**：4 套内置模板（简约白卡片 / 深色数据面板 / 手账便签 / 榜单风），含 **5 个条形图 + 5 个扇形图**、模型用量排行与详细数据表；每个图表可单独开关。
+- **图片报告**：4 套内置模板（简约白卡片 / 深色数据面板 / 手账便签 / 榜单风），含 **5 个条形图 + 6 个扇形图**与模型用量排行表；每个图表可单独开关。
 - **中文单位**：自动使用 万亿 / 亿 / 万 与 天 / 小时 / 分钟 / 秒。
 - **模型别名**：可配置「内部名=显示名」，统计与图片中一律显示别名。
 - **渲染失败自动回退文字版本**：图片渲染失败时记录一次错误日志并改为发送文字报告。
@@ -72,10 +71,15 @@
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `scope` | string | 否 | `all`（默认）/ `current` / `group` / `user` |
+| `scope` | string | 否 | `current`（默认，取本次调用的会话上下文）/ `all` / `group` / `user` |
 | `target_id` | string | 否 | `scope=group` 时的群号；`scope=user` 时的 QQ 号 |
-| `stream_id` | string | 否 | `scope=current` 时必填，当前聊天流 ID |
 | `window` | string | 否 | `今日` / `本周` / `本月` / `最近24小时` / `最近7天` / `最近30天`（也支持 `today` / `this_week` / `this_month` / `last_24h` / `last_7d` / `last_30d`）；留空返回全部窗口 |
+
+工具侧的安全收口（与指令一致）：
+
+- **权限**：与 `/token` 共用同一套黑白名单（用调用上下文里的群号 / QQ 号判定），未授权会话直接拒绝，模型问也拿不到数据；
+- **范围**：只允许查询「统计指令 → 工具可查询范围」里列出的范围，**默认只有 `current`**，因此开箱状态下模型无法替任何人把全局账本或别的群的数据取回来；
+- 会话上下文（`stream_id` / 群号 / QQ 号）由宿主注入，**不由模型提供**，模型无法自己指定要读哪个会话。
 
 返回示例（节选）：
 
@@ -139,20 +143,23 @@
 | `[token_unit]` | `unit_name = "Token"` | 想换成 鸡蛋/词元 直接改这一个字段 |
 | `[model_aliases]` | 空列表 | 可选；不配就显示宿主里的原始模型名 |
 | `[report]` | `enabled = false`、`mode = "template"` | 定时播报默认关闭（避免未经确认就发消息）；要开启需先填 `target_groups` / `target_users` |
-| `[command]` | `enabled = true`、`permission_mode = "all"`、`use_image = true` | **装完在任意群发 `/token` 即可看到报告** |
+| `[command]` | `enabled = true`、`permission_mode = "whitelist"`、`use_image = true`、`tool_allowed_scopes = ["current"]` | **默认只允许白名单里的群用指令**：先把自己的群号填进 `whitelist_groups`（或把 `permission_mode` 改成 `all` 全面开放）；LLM 工具默认只能查当前对话 |
+| `[render]` | `anonymize = true` | 报告里的群名/昵称默认匿名化成 `群聊A` / `个人用户A`，避免群里任何人一句 `/token` 就把别的群晒出来 |
 | `[render]` | `template_name = "simple"`、`image_format = "png"`、内置内地+海外两组字体服务 | 联网即可渲染中文；渲染不可用时自动回退文字 |
-| `[chart]` | 10 个图表开关全为 `true` | 图片报告默认包含 5 条形图 + 5 扇形图 |
+| `[chart]` | 11 个图表开关全为 `true` | 图片报告默认包含 5 条形图 + 6 扇形图 |
 | `[module_groups]` | 已按宿主内置模块名预置 | 无需配置即可得到「计划器/回复器/图片/记忆/表情/插件/其他」分组 |
 | `[limits]` | `max_session_rows = 20000`、`top_models = 20`、`top_modules = 8` | 适配常见数据量；会话明细超上限会明确报错而不是给错数字 |
 
-> 安全提示：`permission_mode` 默认为 `all`（方便装完立刻验证），此时任意群/任意用户都能用 `/token`，其中 `/token all` 会展示全局花费与 Token 数据。若这些数据敏感，请在正式环境改成 `whitelist` 并填写允许的群号/QQ 号，或把 `enabled` 设为 `false` 先关闭指令。
+> 安全提示（隐私与权限边界）：**默认配置是收紧的** —— `command.permission_mode` 默认 `whitelist`、`render.anonymize` 默认 `true`、`command.tool_allowed_scopes` 默认只有 `current`。
+> 也就是说，装完不改配置时：只有 `whitelist_groups` 里列出的群能用 `/token`（未列出的群一律拒绝），图片里的群名/昵称一律匿名化成 `群聊A` / `个人用户A`，LLM 工具也只能查当前对话——**不会出现「群里第一个人发一句 `/token all` 就把全局账本和别的群昵称翻出来」**。
+> 若确实要开放，请显式改配置并自行承担相应风险：把 `permission_mode` 改成 `all`（任何群可用）或 `blacklist`（仅屏蔽黑名单群），把 `anonymize` 改成 `false`（显示真实群名/昵称），把 `tool_allowed_scopes` 加上 `all` / `group` / `user`。想彻底关掉指令把 `enabled` 设为 `false` 即可。
 
 ### 4.1 `[plugin]`
 
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `enabled` | bool | `true` | 是否启用插件 |
-| `config_version` | str | `"1.0.0"` | 配置版本，升级配置结构时递增 |
+| `config_version` | str | `"1.8.0"` | 配置版本，升级配置结构时递增 |
 
 ### 4.2 `[token_unit]`
 
@@ -228,13 +235,14 @@ aliases = [
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `enabled` | bool | `true` | 是否启用 `/token` 指令 |
-| `permission_mode` | str | `"all"` | 群名单制度：`all` 不启用群白名单（群黑名单仍生效）；`whitelist` 启用群白名单；`blacklist` 启用群黑名单 |
+| `permission_mode` | str | `"whitelist"` | 群名单制度：`whitelist` 启用群白名单（**默认，只有白名单内的群可用**）；`all` 不启用群白名单（群黑名单仍生效）；`blacklist` 启用群黑名单 |
 | `whitelist_groups` | list[str] | `[]` | 群白名单：`whitelist` 模式下仅这些群可用；与群黑名单冲突时黑名单优先 |
 | `whitelist_users` | list[str] | `[]` | 用户白名单：命中的用户**始终可用**（优先于群名单；与用户黑名单冲突时黑名单优先） |
 | `blacklist_groups` | list[str] | `[]` | 群黑名单：命中的群在**任何模式下**都不可用（优先于群白名单） |
 | `blacklist_users` | list[str] | `[]` | 用户黑名单：命中的用户**始终不可用**（最高优先级，优先于用户白名单） |
 | `notify_no_permission` | bool | `true` | 无权限时是否回复提示；关闭后无权限调用完全静默 |
 | `deny_message` | str | `"你没有权限使用该指令"` | 无权限时的提示内文；留空则不回复 |
+| `tool_allowed_scopes` | list[str] | `["current"]` | **LLM 工具 `query_token_usage` 允许查询的范围**（与指令共用上面的黑白名单，但范围另受此列表限制）：可填 `current` / `all` / `group` / `user`，留空 = 禁止模型通过工具查询任何范围 |
 | `use_image` | bool | `true` | 指令回复是否使用图片渲染 |
 
 **权限判定规则（严格按顺序）**：
@@ -243,8 +251,8 @@ aliases = [
 2. 用户在 `blacklist_users` 中 → **始终拒绝**（用户层黑名单优先于用户白名单）；
 3. 用户在 `whitelist_users` 中 → **始终放行**（优先于群名单，包括群黑名单）；
 4. 群在 `blacklist_groups` 中 → **拒绝**（群层黑名单优先于群白名单，且不区分名单制度）；
-5. `permission_mode = "all"` → 放行（不启用群白名单）；
-6. `permission_mode = "whitelist"` → 群聊要求群号在 `whitelist_groups` 中；私聊没有群可判定，只能靠用户白名单，未列入即拒绝；
+5. `permission_mode = "whitelist"`（默认）→ 群聊要求群号在 `whitelist_groups` 中；私聊没有群可判定，只能靠用户白名单，未列入即拒绝；
+6. `permission_mode = "all"` → 放行（不启用群白名单）；
 7. `permission_mode = "blacklist"` → 群聊未命中群黑名单即放行（命中已在第 4 步处理）；私聊放行。
 
 > 冲突处理：**同一个用户同时出现在用户黑白名单 → 黑名单胜出**；**同一个群同时出现在群黑白名单 → 黑名单胜出**。用户名单优先于群名单，用户白名单可以放行一个处于群黑名单中的群（见下方示例）。
@@ -272,10 +280,10 @@ aliases = [
 | `second_round_timeout_ms` | int | `25000` | 第二轮（回退轮）渲染超时（毫秒） |
 | `viewport_width` / `viewport_height` | int | `1000` / `600` | 第一轮渲染视口 |
 | `fallback_viewport_width` / `fallback_viewport_height` | int | `900` / `1200` | 第二轮（回退轮）渲染视口兜底宽高 |
-| `allow_network` | bool | `true` | 是否允许渲染页面访问外部网络（加载字体 CDN 需要） |
+| `allow_network` | bool | `true` | 是否允许渲染页面访问外部网络（加载字体 CDN 需要）；**注意**：渲染页面会访问 `font_services` 里的地址，插件只校验其为 `http(s)` 前缀，因此部署者若把它配成 `127.0.0.1` 或内网 / 云元数据地址（如 `169.254.169.254`），渲染页面也会去访问这些地址——配置权在部署者手上、不受聊天输入影响，请自行确认 `font_services` 只填可信的字体服务 |
 | `font_services` | list[str] | 内地 + 海外两组 | 字体服务组，见 4.6.1 |
 | `show_details` | bool | `true` | 是否输出**模型用量排行表**（图片末尾的表格，含 # 名次、Token、调用次数、费用、平均耗时、占比）；文本模板里的 `{details}` 占位符同样受它控制 |
-| `anonymize` | bool | `false` | 是否匿名化聊天对象：**聊天消息分布扇形图**与**各聊天流消息数趋势图**里的群名/昵称统一显示为 `群聊A` / `个人用户A`（拿不到会话类型时显示 `会话X`），文字报告与图片报告口径一致 |
+| `anonymize` | bool | `true` | 是否匿名化聊天对象（**默认开启**）：**聊天消息分布扇形图**与**各聊天流消息数趋势图**里的群名/昵称统一显示为 `群聊A` / `个人用户A`（拿不到会话类型时显示 `会话X`），文字报告与图片报告口径一致；改成 `false` 会显示真实群名/昵称 |
 
 **4.6.1 字体服务组格式**：每条为 `名称|CSS 基地址|静态字体基地址`，按列表顺序作为优先级：
 
@@ -289,6 +297,9 @@ font_services = [
 - 渲染时按顺序使用第一个服务组；若本轮渲染失败（超时或异常）自动换下一组重试；两组都失败后进入第二轮（兜底视口）再按同样顺序重试。
 - 整条渲染管线有 **45 秒总预算**（常量，防止超出宿主 60 秒组件调用超时）；预算耗尽会直接放弃并回退文字版本。
 - 条目格式非法（不是 3 段或不是 http(s) 地址）会被跳过并记录一次警告。
+
+> **最低 SDK 版本**：`render.html2png` 的超时参数在 SDK 里由旧版的 `timeout_ms` 改名为 `render_timeout_ms`。插件优先用 `render_timeout_ms` 调用，仅在捕获到 `TypeError` 且异常信息里含 `render_timeout_ms` 时才回退到旧名 `timeout_ms` 重试（[renderer.py](file:///h:/Files/Code/MaiBot%E6%8F%92%E4%BB%B6%E5%BC%80%E5%8F%91/plugins/token_usage_report/renderer.py)）。
+> 这段兼容写法**依赖宿主的异常文案**：若宿主换了报错方式（不再是 `TypeError`，或信息里不再出现参数名），回退不会触发、渲染会直接失败并回退文字版。因此请确保宿主 / SDK 版本满足 [`_manifest.json`](file:///h:/Files/Code/MaiBot%E6%8F%92%E4%BB%B6%E5%BC%80%E5%8F%91/plugins/token_usage_report/_manifest.json) 里声明的 `sdk.min_version`（`2.9.0`）——该版本起 `render.html2png` 即接受 `render_timeout_ms`，走的是主路径，不依赖上面的兼容回退。兼容分支仅用于兜底更早的 SDK，未来若确认不再需要会移除。
 
 **4.6.2 自定义图片模板（可添加，无需改代码）**
 
@@ -408,6 +419,7 @@ font_services = [
 - **模块花费**：宿主没有「按模块聚合花费」的能力，插件对 Token 排名前 `limits.top_modules` 个模块逐个查询后汇总，其余模块归入「其他」。
 - **缓存指标**：宿主聚合表（`statistics_model_hourly`）不含缓存字段，因此缓存命中率 / 命中 Token / 未命中 Token **只有会话视图（`ModelUsage` 调用明细）能拿到**；全局视图不再输出这几项（KPI 里不显示、模板里引用它们的那一行会被整行隐藏），而不是显示「宿主不提供」。
 - **会话维度**：不包含消息数 / 回复数 / 在线时长（宿主无按会话过滤这些指标的能力）；会话明细读取超上限时**直接报错**，不会给出被截断的错误数字。
+- **会话视图依赖宿主内部表结构（无对外承诺）**：会话维度通过 `database.get` 读取宿主的 `ModelUsage` 表（实际表名 `llm_usage`）并依赖其中的 `total_tokens` / `timestamp` 等列名。`database.get` 是公开能力，但**表名与列结构属于宿主内部实现、文档没有承诺**。为此插件加了结构守卫：取到行却读不到已知字段时会**直接报错**（提示「宿主 ModelUsage 表结构与插件不兼容，缺少字段：…」），而不是用 `row.get(...) or 0` 把一切兜成 0、静默算出错误数字。若你看到这条报错，说明宿主升级改了表结构，请把报错反馈给插件作者。
 - **指定时间后的口径**：`/token all 今日` 这类查询会把**整份报告**收敛到该窗口——插件的取数档位按窗口跨度选择，并在取数后按时间戳把每条序列裁剪到窗口起点，所以窗口卡片、趋势图、模型排行与占比分布来自同一份窗口内数据，彼此口径一致。「今日 / 本周 / 本月」以零点为起点，裁剪后完全精确；跨度超过 7 天的窗口（如「最近30×24小时」）改用天桶，最早不足一天的部分不计入。
 - **统计范围**：`scope=all` 取全部会话的宿主聚合表；`current` / `group` / `user` 取对应会话的 `ModelUsage` 明细，所以指定会话 + 指定时间时同样只统计该窗口内的调用。
 - **以下功能因宿主能力限制未实现**：
@@ -426,7 +438,8 @@ font_services = [
 - **`/token 群 xxx` 提示找不到会话？** 说明该群尚未与 Bot 产生过聊天流记录；可以让群里先发一条消息，或在配置中改用私聊目标。
 - **Pillow 需要自己安装吗？** 不需要，宿主已依赖 `pillow>=12.3.0`；插件的 `requirements.txt` 仅供本地开发与静态检查参考。
 - **怎么让转述更像麦麦？** 把 `report.mode` 设为 `llm`，`report.use_persona` 保持 `true`（会自动读取宿主的 `[personality] personality`、`[personality] reply_style` 与 `[bot] nickname`），`report.llm_task_name` 填你想复用的宿主模型组（例如 `replyer`），必要时再用 `report.persona_extra` 补充额外设定。
-- **权限怎么配？** 例如只允许两个群使用：`permission_mode = "whitelist"` + `whitelist_groups = ["111", "222"]`；若还要让管理员在任何群里都能用：再把管理员 QQ 号填进 `whitelist_users`（用户白名单优先于群名单）；若只想屏蔽某个群：`permission_mode = "blacklist"` + `blacklist_groups = ["111"]`；若想永久屏蔽某人：`blacklist_users = ["444"]`（最高优先级，三种模式下都生效）。
+- **权限怎么配？** 默认就是 `permission_mode = "whitelist"`，只要把允许的群号填进 `whitelist_groups` 即可（例如 `["111", "222"]`）；想让所有群都能用就改成 `all`。若还要让管理员在任何群里都能用：把管理员 QQ 号填进 `whitelist_users`（用户白名单优先于群名单）；若只想屏蔽某个群：`permission_mode = "blacklist"` + `blacklist_groups = ["111"]`；若想永久屏蔽某人：`blacklist_users = ["444"]`（最高优先级，三种模式下都生效）。
+- **模型问「这个月烧了多少 token」被拒？** 这是默认行为：LLM 工具与 `/token` 共用同一套黑白名单，且可查范围默认只有 `current`（当前对话）。要让模型能查全局 / 指定群 / 指定用户，请在配置里把 `command.tool_allowed_scopes` 加上 `all` / `group` / `user`（留空则完全禁止模型查询）；需要全局数据时更推荐由管理员直接发 `/token all`。
 
 ## 7. 开发说明
 
@@ -464,3 +477,4 @@ font_services = [
 | 1.6.4 | 合并图片里重复的两张表：「详细数据」与「模型用量排行」列与数据完全相同，现统一为**模型用量排行表**（含 # 名次），由 `render.show_details` 控制（关掉即只保留图表与总览指标）；顺带修正占比分母——此前只按显示出来的模型求和，模型数超过「显示条数」时占比会虚高，现改为按全部模型合计 |
 | 1.7.0 | 图片新增**模型调用量分布**扇形图（各模型被调用次数的占比，`chart.pie_model_requests` 可关）：与模型 Token / 花费占比互补，便于看哪个模型用得最频繁；全局与会话视图都支持 |
 | 1.7.1 | 报告新增**聊天链路 Token（占 X%）** 指标并补充口径脚注：总量包含记忆抽取、embedding、图片理解等后台流水线，很多时候它们才是大头，核对「我实际用了多少」请看这一格；「模块 Token 占比」改为用带时间戳的按模块序列统计（一次调用覆盖全部模块，不再受 `limits.top_modules` 截断，单窗口模式下也精确）；脚注新增窗口口径说明（日历零点 vs 滚动时长、宿主聚合 15 分钟刷新） |
+| 1.8.0 | **审核整改（隐私与权限边界）**：`command.permission_mode` 默认由 `all` 收紧为 `whitelist`（只有白名单内的群可用指令）、`render.anonymize` 默认由 `false` 收紧为 `true`（群名/昵称默认匿名化）；LLM 工具 `query_token_usage` 补上与 `/token` 一致的黑白名单判定，并新增 `command.tool_allowed_scopes`（默认只有 `current`）限制工具可查范围，工具不再声明 `stream_id` 参数（会话上下文由宿主注入、模型无法自行指定）；会话视图新增结构守卫——取到行却读不到已知字段时**明确报错**（「宿主 ModelUsage 表结构与插件不兼容」），不再用 `row.get(...) or 0` 静默兜成 0；README 补充 `render.allow_network` / `font_services` 的安全说明、`render.html2png` 兼容写法依赖异常文案所对应的最低 SDK 版本，以及「会话视图依赖宿主内部表结构」的契约说明 |

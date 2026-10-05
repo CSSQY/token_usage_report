@@ -32,6 +32,14 @@ logger = logging.getLogger(__name__)
 
 _MODEL_USAGE_TABLE = "ModelUsage"
 
+_REQUIRED_USAGE_FIELDS = ("total_tokens", "timestamp")
+"""会话视图依赖的宿主调用明细字段。
+
+表名与列名是宿主内部实现（走 ``database.get`` 公开能力取数，但表结构本身没有对外承诺），
+取到行却拿不到这些字段时说明宿主结构变了，这里直接报错，避免 ``row.get(...) or 0``
+把一切都兜成 0、静默算出错误数字。
+"""
+
 
 class SessionStatsError(RuntimeError):
     """会话维度统计无法完成时抛出的异常（会话不存在、行数超限等）。"""
@@ -206,7 +214,15 @@ class _SessionCollector:
             raise SessionStatsError(f"读取会话调用明细失败：{exc}") from exc
         if not isinstance(rows, list):
             raise SessionStatsError(f"会话调用明细返回结构异常：{type(rows).__name__}")
-        return [row for row in rows if isinstance(row, dict)]
+        normalized_rows = [row for row in rows if isinstance(row, dict)]
+        if normalized_rows:
+            missing_fields = [field for field in _REQUIRED_USAGE_FIELDS if field not in normalized_rows[0]]
+            if missing_fields:
+                raise SessionStatsError(
+                    "宿主 ModelUsage 表结构与插件不兼容，缺少字段："
+                    f"{'、'.join(missing_fields)}（该视图依赖宿主内部表结构，请把这条报错反馈给插件作者）"
+                )
+        return normalized_rows
 
     # ──── 明细聚合 ────
 

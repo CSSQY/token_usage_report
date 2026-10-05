@@ -66,9 +66,9 @@ class PluginSection(PluginConfigBase):
         json_schema_extra={"label": "启用插件", "hint": "关闭后 /token、LLM 工具与定时播报全部停止"},
     )
     config_version: str = Field(
-        default="1.7.1",
+        default="1.8.0",
         description="配置结构版本，由插件维护；升级配置结构时递增，用户一般不需要改动",
-        json_schema_extra={"label": "配置版本", "hint": "插件用它判断是否升级配置结构，一般不用改", "placeholder": "1.7.1"},
+        json_schema_extra={"label": "配置版本", "hint": "插件用它判断是否升级配置结构，一般不用改", "placeholder": "1.8.0"},
     )
 
 
@@ -256,11 +256,13 @@ class CommandSection(PluginConfigBase):
         json_schema_extra={"label": "启用指令", "hint": "关闭后 /token 与 /tokens 不再响应，其他功能不受影响"},
     )
     permission_mode: Literal["all", "whitelist", "blacklist"] = Field(
-        default="all",
-        description="群名单制度：决定是否启用群白名单/群黑名单；用户名单在三种模式下都生效",
+        default="whitelist",
+        description="群名单制度：默认「群白名单」（只有白名单内的群可用，避免群里任何人一句话就把全局账本翻出来）；"
+        "确认要开放给所有群时再改成「不限制」",
         json_schema_extra={
             "label": "群名单制度",
-            "hint": "选「不限制」=不启用群白名单（群黑名单仍生效）；选「群白名单」=只有白名单里的群可用；选「群黑名单」=黑名单里的群不可用。用户名单三种制度下都生效，且冲突时黑名单优先",
+            "hint": "默认「群白名单」：先把允许用指令的群号填到下面的白名单里；选「不限制」=任何群都能用（群黑名单仍生效）；"
+            "选「群黑名单」=黑名单里的群不可用。用户名单三种制度下都生效，且冲突时黑名单优先",
         },
     )
     whitelist_groups: List[str] = Field(
@@ -310,6 +312,19 @@ class CommandSection(PluginConfigBase):
             "label": "无权限提示",
             "hint": "「提示无权限」开启时回复的内容；留空则不回复",
             "placeholder": "你没有权限使用该指令",
+        },
+    )
+    tool_allowed_scopes: List[str] = Field(
+        default_factory=lambda: ["current"],
+        description="LLM 工具 query_token_usage 允许查询的范围（默认只允许当前对话）；"
+        "填 current / all / group / user，留空表示禁止通过工具查询",
+        json_schema_extra={
+            **_list_field(
+                "current",
+                "填 current=当前对话（默认）/ all=全部会话 / group=指定群 / user=指定用户，填完点 + 添加；"
+                "留空=模型完全不能查（工具存在但一律拒绝）",
+            ),
+            "label": "工具可查询范围",
         },
     )
     use_image: bool = Field(
@@ -463,9 +478,13 @@ class RenderSection(PluginConfigBase):
         },
     )
     anonymize: bool = Field(
-        default=False,
-        description="开启后「聊天消息分布」扇形图会把群名/昵称替换成 群聊A / 个人用户A，便于对外分享截图",
-        json_schema_extra={"label": "聊天对象匿名化", "hint": "开启后扇形图里显示「群聊A / 个人用户A」，便于对外截图"},
+        default=True,
+        description="开启后聊天对象（群名 / 昵称）在报告里统一显示为 群聊A / 个人用户A，避免群里任何人发一句 /token 就把别的群名和群友昵称晒出来",
+        json_schema_extra={
+            "label": "聊天对象匿名化",
+            "hint": "默认开启：聊天消息分布与聊天流趋势图里的群名/昵称显示为「群聊A / 个人用户A」；"
+            "只有你确定报告不会外传时再关掉",
+        },
     )
 
 
