@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 import logging
 import math
+import re
 
 from .config_model import TokenUsageReportConfig
 from .metrics import (
@@ -21,6 +22,7 @@ from .metrics import (
     format_per_hour,
     format_response_zh,
     format_tokens_per_hour,
+    model_token_total,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,6 +39,8 @@ _PALETTE: Tuple[str, ...] = (
     "#BB6BD9",
     "#56CCF2",
 )
+
+_HEX_COLOR_PATTERN = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
 _THEMES: Dict[str, Dict[str, str]] = {
     "simple": {
@@ -129,6 +133,112 @@ def describe_template(template_name: str) -> str:
     }.get(template_name, template_name)
 
 
+def parse_custom_templates(raw_templates: Sequence[str]) -> Dict[str, Dict[str, str]]:
+    """解析「自定义模板」配置。
+
+    每条格式为 ``名称|基础样式|主色|页背景色|卡片底色``，其中：
+    ``基础样式`` 必须是内置的 simple / dark / handbook / rank；
+    后三段为可选的 ``#RRGGBB`` 颜色，省略时沿用基础样式的配色。
+
+    Args:
+        raw_templates: 配置中的自定义模板条目。
+
+    Returns:
+        Dict[str, Dict[str, str]]: 模板名到「基础样式 + 颜色覆盖」的映射；非法条目被跳过。
+    """
+
+    custom_map: Dict[str, Dict[str, str]] = {}
+    for raw_entry in raw_templates:
+        entry = str(raw_entry or "").strip()
+        if not entry:
+            continue
+        parts = [part.strip() for part in entry.split("|")]
+        if len(parts) < 3 or not all(parts[:3]):
+            logger.warning(
+                "[token_usage_report] 自定义模板格式非法，已跳过：%s（应为「名称|基础样式|主色[|页背景色[|卡片底色]]」）",
+                entry,
+            )
+            continue
+        name, base_style, accent = parts[0], parts[1], parts[2]
+        if name in _THEMES:
+            logger.warning("[token_usage_report] 自定义模板名与内置模板重名，已跳过：%s", entry)
+            continue
+        if base_style not in _THEMES:
+            logger.warning(
+                "[token_usage_report] 自定义模板的基础样式非法，已跳过：%s（可选 %s）",
+                entry,
+                " / ".join(_THEMES),
+            )
+            continue
+        if not _HEX_COLOR_PATTERN.fullmatch(accent):
+            logger.warning("[token_usage_report] 自定义模板主色非法，已跳过：%s（应为 #RRGGBB）", entry)
+            continue
+
+        theme_patch = {"base": base_style, "accent": accent, "page_bg": "", "card_bg": ""}
+        optional_colors = (("page_bg", 3), ("card_bg", 4))
+        invalid_color = False
+        for key, index in optional_colors:
+            if index >= len(parts):
+                continue
+            color = parts[index]
+            if not color:
+                continue
+            if not _HEX_COLOR_PATTERN.fullmatch(color):
+                logger.warning("[token_usage_report] 自定义模板 %s 的颜色非法，已跳过：%s（应为 #RRGGBB）", key, entry)
+                invalid_color = True
+                break
+            theme_patch[key] = color
+        if invalid_color:
+            continue
+
+        if name in custom_map:
+            logger.warning("[token_usage_report] 自定义模板名重复，后一条覆盖前一条：%s", name)
+        custom_map[name] = theme_patch
+    return custom_map
+
+
+def resolve_theme(config: TokenUsageReportConfig) -> Tuple[Dict[str, str], str]:
+    """解析出本次渲染实际使用的主题。
+
+    优先匹配 4 套内置模板；否则查「自定义模板」；都不命中时记录一条错误日志并回退 simple。
+
+    Args:
+        config: 插件配置。
+
+    Returns:
+        Tuple[Dict[str, str], str]: ``(主题配色, 实际使用的模板名)``。
+    """
+
+    requested_name = str(config.render.template_name or "").strip() or "simple"
+    if requested_name in _THEMES:
+        return dict(_THEMES[requested_name]), requested_name
+
+    custom_map = parse_custom_templates(config.render.custom_templates)
+    custom = custom_map.get(requested_name)
+    if custom is None:
+        logger.error(
+            "[token_usage_report] 图片模板 %s 不存在（内置：%s；自定义：%s），本次回退 simple",
+            requested_name,
+            " / ".join(_THEMES),
+            " / ".join(custom_map) or "无",
+        )
+        return dict(_THEMES["simple"]), "simple"
+
+    theme = dict(_THEMES[custom["base"]])
+    theme["accent"] = custom["accent"]
+    if custom.get("page_bg"):
+        theme["page_bg"] = custom["page_bg"]
+    if custom.get("card_bg"):
+        theme["card_bg"] = custom["card_bg"]
+    return theme, requested_name
+
+
+def list_available_templates(config: TokenUsageReportConfig) -> List[str]:
+    """返回当前可用的模板名清单（内置 + 自定义），用于日志与排查。"""
+
+    return [*_THEMES, *parse_custom_templates(config.render.custom_templates)]
+
+
 def build_html(metrics: ReportMetrics, config: TokenUsageReportConfig, font_service: FontService) -> str:
     """生成完整的报告 HTML。
 
@@ -141,18 +251,20 @@ def build_html(metrics: ReportMetrics, config: TokenUsageReportConfig, font_serv
         str: 可直接交给宿主渲染的 HTML 文本。
     """
 
-    theme_name = config.render.template_name
-    theme = _THEMES.get(theme_name, _THEMES["simple"])
-    sections: List[str] = [
-        _render_header(metrics),
-        _render_window_cards(metrics),
-        _render_kpi_block(metrics),
-        _render_bar_section(metrics, config, theme),
-        _render_pie_section(metrics, config, theme),
-        _render_model_table(metrics),
-        _render_detail_table(metrics, config),
-        _render_footer(metrics),
-    ]
+    theme, theme_name = resolve_theme(config)
+    sections: List[str] = [_render_header(metrics)]
+    if not metrics.window_scoped:
+        # 单窗口模式下「总览指标」本身就是该窗口的合计，不再重复渲染窗口卡片
+        sections.append(_render_window_cards(metrics))
+    sections.extend(
+        [
+            _render_kpi_block(metrics),
+            _render_bar_section(metrics, config, theme),
+            _render_pie_section(metrics, config, theme),
+            _render_model_table(metrics, config),
+            _render_footer(metrics),
+        ]
+    )
     body = "\n".join(section for section in sections if section)
     return (
         "<!DOCTYPE html>\n"
@@ -232,18 +344,17 @@ def _render_window_cards(metrics: ReportMetrics) -> str:
 
 
 def _render_kpi_block(metrics: ReportMetrics) -> str:
-    """渲染总计与派生指标。"""
+    """渲染总计（单窗口模式下即窗口合计）与派生指标。"""
 
     total = metrics.total
     total_cost = total.cost if total is not None else None
     kpis: List[Tuple[str, str]] = []
     if total is not None:
+        scope_note = metrics.total_scope_note or "最近 365 天"
+        total_title = f"{scope_note}合计" if metrics.window_scoped else f"总计（{scope_note}）"
         kpis.extend(
             [
-                (
-                    f"总计（{metrics.total_scope_note or '最近 365 天'}）",
-                    f"{format_number_zh(total.tokens)} {metrics.unit_name}",
-                ),
+                (total_title, f"{format_number_zh(total.tokens)} {metrics.unit_name}"),
                 ("输入 Token", format_number_zh(total.prompt_tokens)),
                 ("输出 Token", format_number_zh(total.completion_tokens)),
                 ("总请求数", format_number_zh(total.requests)),
@@ -271,22 +382,21 @@ def _render_kpi_block(metrics: ReportMetrics) -> str:
                 "Token/时间",
                 format_tokens_per_hour(total.tokens if total else None, metrics.online_hours, metrics.unit_name),
             ),
-            (
-                "Prompt 缓存命中率",
-                f"{total.cache_hit_rate * 100:.2f}%" if total and total.cache_hit_rate is not None else "宿主不提供",
-            ),
-            (
-                "缓存命中 Token",
-                format_number_zh(total.cache_hit_tokens) if total and total.cache_hit_tokens is not None else "宿主不提供",
-            ),
-            (
-                "缓存未命中 Token",
-                format_number_zh(total.cache_miss_tokens)
-                if total and total.cache_miss_tokens is not None
-                else "宿主不提供",
-            ),
         ]
     )
+    # 缓存指标只有会话维度（调用明细）才有；全局视图没有数据，直接不渲染这几格
+    if total is not None and total.cache_hit_rate is not None:
+        kpis.extend(
+            [
+                ("Prompt 缓存命中率", f"{total.cache_hit_rate * 100:.2f}%"),
+                ("缓存命中 Token", format_number_zh(total.cache_hit_tokens)),
+                ("缓存未命中 Token", format_number_zh(total.cache_miss_tokens)),
+            ]
+        )
+    if metrics.chat_tokens is not None and total is not None and total.tokens > 0:
+        # 报告总量含记忆/图片等后台流水线，单独标出聊天链路，便于与直觉核对
+        chat_share = metrics.chat_tokens / total.tokens * 100
+        kpis.append((f"聊天链路 Token（占 {chat_share:.1f}%）", format_number_zh(metrics.chat_tokens)))
     items = "".join(
         f"<div class=\"kpi\"><div class=\"kpi-title\">{_escape(title)}</div>"
         f"<div class=\"kpi-value\">{_escape(value)}</div></div>"
@@ -295,7 +405,11 @@ def _render_kpi_block(metrics: ReportMetrics) -> str:
     return f"<h2>总览指标</h2>\n<div class=\"kpi-grid\">{items}</div>"
 
 
-def _render_bar_section(metrics: ReportMetrics, config: TokenUsageReportConfig, theme: Dict[str, str]) -> str:
+def _render_bar_section(
+    metrics: ReportMetrics,
+    config: TokenUsageReportConfig,
+    theme: Dict[str, str],
+) -> str:
     """渲染全部条形图卡片。"""
 
     chart_config = config.chart
@@ -306,6 +420,14 @@ def _render_bar_section(metrics: ReportMetrics, config: TokenUsageReportConfig, 
         ("module_cost", chart_config.bar_module_cost, "各模块花费趋势"),
         ("chat_messages", chart_config.bar_chat_messages, "各聊天流消息数趋势"),
     )
+    granularity_label = _granularity_label(metrics.chart_granularity or chart_config.bar_granularity)
+    windows = metrics.ordered_windows()
+    if metrics.window_scoped and windows:
+        # 单窗口模式下趋势图的数据已被裁剪到该窗口，按窗口名标注
+        range_label = f"（{granularity_label} · {windows[0].label}）"
+    else:
+        range_label = f"（{granularity_label} · 近 {chart_config.bar_days} 天）"
+
     cards: List[str] = []
     for key, enabled, title in chart_specs:
         if not enabled:
@@ -313,11 +435,10 @@ def _render_bar_section(metrics: ReportMetrics, config: TokenUsageReportConfig, 
         series_data = metrics.bars.get(key)
         if series_data is None or not series_data.labels:
             continue
-        granularity_label = _granularity_label(chart_config.bar_granularity)
         cards.append(
             "<div class=\"chart-card\">"
-            f"<div class=\"chart-title\">{_escape(title)}（{_escape(granularity_label)}）</div>"
-            f"{render_bar_chart(series_data, theme)}"
+            f"<div class=\"chart-title\">{_escape(title)}{_escape(range_label)}</div>"
+            f"{render_trend_chart(series_data, theme, style=chart_config.chart_style)}"
             "</div>"
         )
     if not cards:
@@ -325,7 +446,11 @@ def _render_bar_section(metrics: ReportMetrics, config: TokenUsageReportConfig, 
     return f"<h2>用量趋势</h2>\n{''.join(cards)}"
 
 
-def _render_pie_section(metrics: ReportMetrics, config: TokenUsageReportConfig, theme: Dict[str, str]) -> str:
+def _render_pie_section(
+    metrics: ReportMetrics,
+    config: TokenUsageReportConfig,
+    theme: Dict[str, str],
+) -> str:
     """渲染全部扇形图卡片。"""
 
     chart_config = config.chart
@@ -334,6 +459,7 @@ def _render_pie_section(metrics: ReportMetrics, config: TokenUsageReportConfig, 
         ("module_cost", chart_config.pie_module_cost, "模块花费分布", "cost"),
         ("model_tokens", chart_config.pie_model_tokens, "模型 Token 占比", "number"),
         ("model_cost", chart_config.pie_model_cost, "模型花费分布", "cost"),
+        ("model_requests", chart_config.pie_model_requests, "模型调用量分布", "number"),
         ("chat_messages", chart_config.pie_chat_messages, "聊天消息分布", "number"),
     )
     cards: List[str] = []
@@ -354,13 +480,13 @@ def _render_pie_section(metrics: ReportMetrics, config: TokenUsageReportConfig, 
     return f"<h2>占比分布</h2>\n{''.join(cards)}"
 
 
-def _render_model_table(metrics: ReportMetrics) -> str:
-    """渲染模型排行表。"""
+def _render_model_table(metrics: ReportMetrics, config: TokenUsageReportConfig) -> str:
+    """渲染模型用量排行表（受 ``render.show_details`` 控制）。"""
 
-    if not metrics.models:
+    if not config.render.show_details or not metrics.models:
         return ""
     rows: List[str] = []
-    token_total = sum(row.tokens for row in metrics.models) or 1
+    token_total = model_token_total(metrics)
     for index, row in enumerate(metrics.models, start=1):
         rank_class = f"rank-{index}" if index <= 3 else ""
         avg_text = format_response_zh(row.avg_response) if row.avg_response is not None else "N/A"
@@ -373,37 +499,6 @@ def _render_model_table(metrics: ReportMetrics) -> str:
     return (
         "<h2>模型用量排行</h2>\n<table><thead><tr>"
         "<th>#</th><th>模型</th><th>Token</th><th>调用次数</th><th>费用</th><th>平均耗时</th><th>占比</th>"
-        f"</tr></thead><tbody>{''.join(rows)}</tbody></table>"
-    )
-
-
-def _render_detail_table(metrics: ReportMetrics, config: TokenUsageReportConfig) -> str:
-    """渲染详细数据表（受 ``render.show_details`` 控制）。"""
-
-    if not config.render.show_details:
-        return ""
-    rows: List[str] = []
-    token_total = sum(row.tokens for row in metrics.models) or 1
-    for row in metrics.models:
-        avg_text = format_response_zh(row.avg_response) if row.avg_response is not None else "N/A"
-        rows.append(
-            f"<tr><td>{_escape(row.name)}</td><td>{row.requests}</td>"
-            f"<td>{_escape(format_number_zh(row.tokens))}</td>"
-            f"<td>{_escape(format_cost_zh(row.cost))}</td><td>{_escape(avg_text)}</td>"
-            f"<td>{row.tokens / token_total * 100:.1f}%</td></tr>"
-        )
-    if not rows:
-        for module_row in metrics.modules:
-            rows.append(
-                f"<tr><td>{_escape(module_row.name)}</td><td>{module_row.requests}</td>"
-                f"<td>{_escape(format_number_zh(module_row.tokens))}</td>"
-                f"<td>{_escape(format_cost_zh(module_row.cost))}</td><td>N/A</td><td>N/A</td></tr>"
-            )
-    if not rows:
-        return ""
-    return (
-        "<h2>详细数据</h2>\n<table><thead><tr>"
-        "<th>名称</th><th>调用次数</th><th>Token</th><th>费用</th><th>平均耗时</th><th>占比</th>"
         f"</tr></thead><tbody>{''.join(rows)}</tbody></table>"
     )
 
@@ -442,13 +537,68 @@ def format_chart_value(value: float, formatter: str) -> str:
     return format_number_zh(value)
 
 
-def render_bar_chart(series_data: SeriesData, theme: Dict[str, str], height: int = 220) -> str:
-    """渲染多序列纵向条形图（纯内联 SVG）。
+_MARKER_LABEL_LIMIT = 40
+"""折线数据点最多画到这么多个点：再多就只画线，避免 SVG 体积与视觉噪音失控。"""
+
+
+def _smooth_path(points: Sequence[Tuple[float, float]], *, top: float, bottom: float) -> str:
+    """把数据点连成平滑曲线（Catmull-Rom 转三次贝塞尔）。
+
+    曲线**经过每个数据点**，因此数据点标记与柱子保持对齐；控制点会被夹在
+    ``[top, bottom]`` 之间，避免曲线在数值突变处冲出绘图区（例如跌到 0 轴以下）。
+
+    Args:
+        points: 数据点坐标，按横轴顺序排列。
+        top: 允许的最高 y 坐标（数值越大 y 越小）。
+        bottom: 允许的最低 y 坐标（零轴）。
+
+    Returns:
+        str: SVG ``path`` 的 ``d`` 属性文本。
+    """
+
+    if not points:
+        return ""
+    if len(points) == 1:
+        point_x, point_y = points[0]
+        return f"M{point_x:.1f},{point_y:.1f}"
+
+    def _clamp(value: float) -> float:
+        return min(max(value, top), bottom)
+
+    commands: List[str] = [f"M{points[0][0]:.1f},{points[0][1]:.1f}"]
+    for index in range(len(points) - 1):
+        previous_point = points[index - 1] if index > 0 else points[index]
+        current_point = points[index]
+        next_point = points[index + 1]
+        after_next = points[index + 2] if index + 2 < len(points) else next_point
+        first_control = (
+            current_point[0] + (next_point[0] - previous_point[0]) / 6,
+            _clamp(current_point[1] + (next_point[1] - previous_point[1]) / 6),
+        )
+        second_control = (
+            next_point[0] - (after_next[0] - current_point[0]) / 6,
+            _clamp(next_point[1] - (after_next[1] - current_point[1]) / 6),
+        )
+        commands.append(
+            f"C{first_control[0]:.1f},{first_control[1]:.1f} "
+            f"{second_control[0]:.1f},{second_control[1]:.1f} {next_point[0]:.1f},{next_point[1]:.1f}"
+        )
+    return "".join(commands)
+
+
+def render_trend_chart(
+    series_data: SeriesData,
+    theme: Dict[str, str],
+    height: int = 220,
+    style: str = "bar",
+) -> str:
+    """渲染多序列趋势图（条形 / 折线 / 条形叠加折线，纯内联 SVG）。
 
     Args:
         series_data: 序列数据。
         theme: 主题配色。
         height: 图表高度。
+        style: 图形样式，``bar``=仅条形，``line``=仅折线，``bar_line``=条形叠加折线。
 
     Returns:
         str: SVG 与图例的 HTML 片段。
@@ -457,6 +607,8 @@ def render_bar_chart(series_data: SeriesData, theme: Dict[str, str], height: int
     labels = series_data.labels
     if not labels:
         return ""
+    draw_bars = style in {"bar", "bar_line"}
+    draw_lines = style in {"line", "bar_line"}
     series_names = list(series_data.series.keys())
     max_value = max((max(values) if values else 0.0) for values in series_data.series.values()) or 1.0
 
@@ -468,36 +620,70 @@ def render_bar_chart(series_data: SeriesData, theme: Dict[str, str], height: int
     plot_width = width - padding_left * 2
     group_width = plot_width / max(len(labels), 1)
     bar_width = max(1.5, (group_width * 0.72) / max(len(series_names), 1))
+    baseline = padding_top + plot_height
+
+    def _value_at(series_name: str, index: int) -> float:
+        """取某序列在某个横轴位置上的数值（越界按 0 处理）。"""
+
+        values = series_data.series[series_name]
+        return float(values[index] or 0) if index < len(values) else 0.0
 
     parts: List[str] = [
         f"<svg viewBox=\"0 0 {width} {height}\" width=\"100%\" height=\"{height}\" "
         "xmlns=\"http://www.w3.org/2000/svg\" role=\"img\">"
     ]
     parts.append(
-        f"<line x1=\"{padding_left}\" y1=\"{padding_top + plot_height}\" "
-        f"x2=\"{width - padding_left}\" y2=\"{padding_top + plot_height}\" "
+        f"<line x1=\"{padding_left}\" y1=\"{baseline}\" "
+        f"x2=\"{width - padding_left}\" y2=\"{baseline}\" "
         f"stroke=\"{theme['border']}\" stroke-width=\"1\"/>"
     )
     label_step = max(1, len(labels) // 12)
+    if draw_bars:
+        for index, label in enumerate(labels):
+            group_x = padding_left + index * group_width
+            for series_index, series_name in enumerate(series_names):
+                value = _value_at(series_name, index)
+                bar_height = max(0.0, value / max_value * plot_height)
+                bar_x = group_x + (group_width - bar_width * len(series_names)) / 2 + series_index * bar_width
+                bar_y = baseline - bar_height
+                color = _PALETTE[series_index % len(_PALETTE)]
+                # 叠加折线时条形半透明，避免遮住折线
+                opacity = " fill-opacity=\"0.55\"" if draw_lines else ""
+                tooltip = f"{series_name} {label}：{format_chart_value(value, series_data.value_formatter)}"
+                parts.append(
+                    f"<rect x=\"{bar_x:.1f}\" y=\"{bar_y:.1f}\" width=\"{bar_width:.1f}\" height=\"{bar_height:.1f}\" "
+                    f"fill=\"{color}\"{opacity} rx=\"2\"><title>{_escape(tooltip)}</title></rect>"
+                )
     for index, label in enumerate(labels):
-        group_x = padding_left + index * group_width
+        if index % label_step != 0:
+            continue
+        parts.append(
+            f"<text x=\"{padding_left + index * group_width + group_width / 2:.1f}\" y=\"{height - 8}\" font-size=\"10\" "
+            f"fill=\"{theme['muted']}\" text-anchor=\"middle\">{_escape(label)}</text>"
+        )
+    if draw_lines:
+        draw_markers = len(labels) <= _MARKER_LABEL_LIMIT
         for series_index, series_name in enumerate(series_names):
-            values = series_data.series[series_name]
-            value = float(values[index] or 0) if index < len(values) else 0.0
-            bar_height = max(0.0, value / max_value * plot_height)
-            bar_x = group_x + (group_width - bar_width * len(series_names)) / 2 + series_index * bar_width
-            bar_y = padding_top + plot_height - bar_height
             color = _PALETTE[series_index % len(_PALETTE)]
-            tooltip = f"{series_name} {label}：{format_chart_value(value, series_data.value_formatter)}"
+            points: List[Tuple[float, float]] = []
+            markers: List[str] = []
+            for index, label in enumerate(labels):
+                value = _value_at(series_name, index)
+                point_x = padding_left + index * group_width + group_width / 2
+                point_y = baseline - value / max_value * plot_height
+                points.append((point_x, point_y))
+                if not draw_markers:
+                    continue
+                tooltip = f"{series_name} {label}：{format_chart_value(value, series_data.value_formatter)}"
+                markers.append(
+                    f"<circle cx=\"{point_x:.1f}\" cy=\"{point_y:.1f}\" r=\"2.5\" fill=\"{color}\">"
+                    f"<title>{_escape(tooltip)}</title></circle>"
+                )
             parts.append(
-                f"<rect x=\"{bar_x:.1f}\" y=\"{bar_y:.1f}\" width=\"{bar_width:.1f}\" height=\"{bar_height:.1f}\" "
-                f"fill=\"{color}\" rx=\"2\"><title>{_escape(tooltip)}</title></rect>"
+                f"<path d=\"{_smooth_path(points, top=padding_top, bottom=baseline)}\" fill=\"none\" "
+                f"stroke=\"{color}\" stroke-width=\"2\" stroke-linejoin=\"round\" stroke-linecap=\"round\"/>"
             )
-        if index % label_step == 0:
-            parts.append(
-                f"<text x=\"{group_x + group_width / 2:.1f}\" y=\"{height - 8}\" font-size=\"10\" "
-                f"fill=\"{theme['muted']}\" text-anchor=\"middle\">{_escape(label)}</text>"
-            )
+            parts.extend(markers)
     parts.append("</svg>")
     if len(series_names) > 1:
         legend_items = "".join(

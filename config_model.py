@@ -3,10 +3,11 @@
 所有配置节均继承 ``PluginConfigBase``，由 Runner 负责补齐默认值、
 生成 ``config.toml`` 以及向 WebUI 提供配置表单 Schema。
 
-字段的 ``json_schema_extra`` 用于 WebUI 可视化：
-``label`` 是表单里的中文短名，``placeholder`` 是输入示例，
-``x-widget`` 决定控件类型，``x-option-labels`` / ``x-option-descriptions``
-为下拉选项提供中文名与逐项说明，``description`` 则是字段下方的用途说明。
+字段的 ``json_schema_extra`` 用于 WebUI 可视化，按宿主 Dashboard 的实际取值：
+``label`` 是表单里的中文短名；``hint`` 是字段下方**直接显示**的说明（插件配置页
+只显示 hint，不显示 description）；``placeholder`` 是输入框示例；
+``x-widget`` 会被宿主规范化为 ``ui_type``，其中字符串列表必须用 ``list``
+（``tags`` 在该页面没有对应控件，会退化成普通输入框）。
 """
 
 from typing import Dict, List, Literal
@@ -15,14 +16,14 @@ from maibot_sdk import Field, PluginConfigBase
 
 _DEFAULT_TEMPLATE = """📊 {unit_name} 消耗统计（{date}）
 统计范围：{scope_name}
-今日：{today}（{today_requests} 次请求 / {today_cost}）
-本周：{this_week}（{this_week_requests} 次请求 / {this_week_cost}）
-本月：{this_month}（{this_month_requests} 次请求 / {this_month_cost}）
-最近24小时：{last_24h}（{last_24h_requests} 次请求 / {last_24h_cost}）
-最近7×24小时：{last_7d}（{last_7d_requests} 次请求 / {last_7d_cost}）
-最近30×24小时：{last_30d}（{last_30d_requests} 次请求 / {last_30d_cost}）
+今日：{today}（{today_requests}次请求 / {today_cost}）
+本周：{this_week}（{this_week_requests}次请求 / {this_week_cost}）
+本月：{this_month}（{this_month_requests}次请求 / {this_month_cost}）
+最近24小时：{last_24h}（{last_24h_requests}次请求 / {last_24h_cost}）
+最近7×24小时：{last_7d}（{last_7d_requests}次请求 / {last_7d_cost}）
+最近30×24小时：{last_30d}（{last_30d_requests}次请求 / {last_30d_cost}）
 总计（{total_scope}）：{total_tokens}
-输入 {total_prompt} / 输出 {total_completion} / 请求 {total_requests} 次 / 花费 {total_cost}
+输入 {total_prompt} / 输出 {total_completion} / 请求 {total_requests}次 / 花费 {total_cost}
 消息 {messages}条 · 回复 {replies}条 · 接收 {received_messages}条 · 在线 {online_duration}
 平均响应 {total_avg_response} · 花费/100条消息 {cost_per_100_messages} · 花费/小时 {cost_per_hour} · {tokens_per_hour}
 {model_ranking}
@@ -35,6 +36,23 @@ _DEFAULT_LLM_PROMPT = (
 )
 
 
+def _list_field(placeholder: str, hint: str) -> Dict[str, object]:
+    """构造字符串列表字段的 UI 元数据。
+
+    列表字段必须声明 ``x-widget: list``，宿主 Dashboard 才会渲染成
+    「输入框 + 添加按钮 + 已添加项列表」的编辑器。
+
+    Args:
+        placeholder: 输入框示例文案。
+        hint: 字段下方直接显示的说明。
+
+    Returns:
+        Dict[str, object]: 列表字段的 json_schema_extra。
+    """
+
+    return {"label": "", "hint": hint, "placeholder": placeholder, "x-widget": "list"}
+
+
 class PluginSection(PluginConfigBase):
     """插件基础配置。"""
 
@@ -45,12 +63,12 @@ class PluginSection(PluginConfigBase):
     enabled: bool = Field(
         default=True,
         description="关闭后插件不会被加载，指令、工具与定时播报全部停止",
-        json_schema_extra={"label": "启用插件"},
+        json_schema_extra={"label": "启用插件", "hint": "关闭后 /token、LLM 工具与定时播报全部停止"},
     )
     config_version: str = Field(
-        default="1.0.0",
+        default="1.7.1",
         description="配置结构版本，由插件维护；升级配置结构时递增，用户一般不需要改动",
-        json_schema_extra={"label": "配置版本", "placeholder": "1.0.0"},
+        json_schema_extra={"label": "配置版本", "hint": "插件用它判断是否升级配置结构，一般不用改", "placeholder": "1.7.1"},
     )
 
 
@@ -64,7 +82,11 @@ class TokenUnitSection(PluginConfigBase):
     unit_name: str = Field(
         default="Token",
         description="Token 的显示单位名称，会出现在文本报告、图片报告与工具返回中，可随意改成 鸡蛋 / 词元 / 白饭 等",
-        json_schema_extra={"label": "单位名称", "placeholder": "例如：Token、鸡蛋、词元"},
+        json_schema_extra={
+            "label": "单位名称",
+            "hint": "改这里就能把报告里的 Token 换成 鸡蛋/词元/白饭 等，例如填「鸡蛋」后显示「1.23 万 鸡蛋」",
+            "placeholder": "例如：Token、鸡蛋、词元",
+        },
     )
 
 
@@ -80,9 +102,8 @@ class ModelAliasSection(PluginConfigBase):
         description="模型显示别名列表，每条格式为「内部名=显示名」，例如 deepseek-v4-flash=小深；"
         "模型排行、占比图与详细数据表都会显示别名，留空则显示宿主里的原始模型名",
         json_schema_extra={
+            **_list_field("内部名=显示名", "在输入框填「内部名=显示名」后点右侧 + 添加；留空则显示原始模型名"),
             "label": "别名列表",
-            "x-widget": "tags",
-            "placeholder": "内部名=显示名",
         },
     )
 
@@ -97,38 +118,43 @@ class ReportSection(PluginConfigBase):
     enabled: bool = Field(
         default=False,
         description="开启后按「发送时刻」定时推送报告；默认关闭，避免在没有配置目标群时就向聊天发消息",
-        json_schema_extra={"label": "启用定时播报"},
+        json_schema_extra={"label": "启用定时播报", "hint": "默认关闭；开启前请先填好目标群号或目标 QQ 号"},
     )
     schedule_times: List[str] = Field(
         default=["08:00", "20:00"],
         description="每日发送时刻，24 小时制 HH:MM，可填多个；已经过去的时刻不会补发",
-        json_schema_extra={"label": "发送时刻", "x-widget": "tags", "placeholder": "08:00"},
+        json_schema_extra={
+            **_list_field("08:00", "在输入框填 HH:MM 后点 + 添加，可加多条；已过去的时刻不补发"),
+            "label": "发送时刻",
+        },
     )
     platform: str = Field(
         default="qq",
         description="目标平台标识，用于把群号/QQ 号解析成聊天流；一般保持 qq 即可",
-        json_schema_extra={"label": "平台", "placeholder": "qq"},
+        json_schema_extra={"label": "平台", "hint": "用于把群号/QQ 号解析成聊天流，通常保持 qq", "placeholder": "qq"},
     )
     target_groups: List[str] = Field(
         default_factory=list,
         description="接收播报的 QQ 群号；群号不存在时会尝试创建聊天流，仍失败则跳过并在日志提示",
-        json_schema_extra={"label": "目标群号", "x-widget": "tags", "placeholder": "123456789"},
+        json_schema_extra={
+            **_list_field("123456789", "填群号后点 + 添加，可加多个群；群不存在会尝试建会话，失败则跳过"),
+            "label": "目标群号",
+        },
     )
     target_users: List[str] = Field(
         default_factory=list,
         description="接收播报的 QQ 号（私聊）；与目标群号可以同时配置",
-        json_schema_extra={"label": "目标 QQ 号", "x-widget": "tags", "placeholder": "10001"},
+        json_schema_extra={
+            **_list_field("10001", "填 QQ 号后点 + 添加，可加多个；与目标群号可以同时配置"),
+            "label": "目标 QQ 号",
+        },
     )
     mode: Literal["template", "llm"] = Field(
         default="template",
         description="报告的文本呈现方式：模板渲染 或 复用宿主模型组做风格化转述",
         json_schema_extra={
             "label": "呈现方式",
-            "x-option-labels": {"template": "文本模板", "llm": "LLM 风格化转述"},
-            "x-option-descriptions": {
-                "template": "按下面的模板与占位符生成固定格式文本，速度快、结果稳定",
-                "llm": "复用宿主的模型组（llm_task_name）把数据转述成自然语言，可自动带上宿主人格",
-            },
+            "hint": "选「文本模板」=固定格式、结果稳定；选「LLM 风格化转述」=用宿主模型组改写成自然语言（可带人格）",
         },
     )
     template: str = Field(
@@ -148,15 +174,16 @@ class ReportSection(PluginConfigBase):
         "总计：{total_tokens} {total_raw} {total_prompt} {total_completion} {total_requests} {total_cost} {total_avg_response}；"
         "消息与运营：{messages} {replies} {received_messages} {online_duration} "
         "{cost_per_100_messages} {cost_per_100_received} {cost_per_100_replies} {cost_per_hour} {tokens_per_hour}；"
-        "缓存（仅会话维度有值，全局显示「宿主不提供」）：{cache_hit_rate} {cache_hit_tokens} {cache_miss_tokens}；"
+        "缓存（仅会话维度有值，全局视图无数据时整行隐藏）：{cache_hit_rate} {cache_hit_tokens} {cache_miss_tokens}；"
         "多行区块：{model_ranking} 模型排行、{module_breakdown} 模块占比、{chat_message_share} 聊天消息分布、"
         "{details} 详细数据表、{unavailable} 本次不可用数据、{notes} 统计口径脚注。"
         "注意事项：正文里若需要显示花括号本身，请写成两个左花括号与两个右花括号；"
         "写错的占位符会被置空并记录一条警告，模板语法错误会回退内置默认模板。",
         json_schema_extra={
             "label": "文本模板",
+            "hint": "占位符随取随用：写哪个就显示哪个，没写的不会出现，空出来的行会自动压掉；把鼠标移到字段名上可看全部 54 个占位符清单",
             "x-widget": "textarea",
-            "x-textarea-rows": 14,
+            "rows": 14,
             "placeholder": "📊 {unit_name} 消耗统计（{date}）…",
         },
     )
@@ -164,12 +191,16 @@ class ReportSection(PluginConfigBase):
         default="utils",
         description="复用的宿主模型组（model_config.toml 里的任务配置名，如 utils / replyer / planner）；"
         "模型与温度等参数都在宿主侧维护，填了不存在的名字时由宿主按默认策略解析",
-        json_schema_extra={"label": "模型组（任务配置名）", "placeholder": "utils"},
+        json_schema_extra={
+            "label": "模型组（任务配置名）",
+            "hint": "填宿主已分配好的模型组名，例如 utils / replyer / planner；模型与温度都由宿主那侧决定",
+            "placeholder": "utils",
+        },
     )
     use_persona: bool = Field(
         default=True,
         description="开启后自动读取宿主人格（[personality] 人格设定与表达风格、[bot] 昵称）并按下面的模板注入提示词",
-        json_schema_extra={"label": "注入宿主人格"},
+        json_schema_extra={"label": "注入宿主人格", "hint": "自动读取宿主的 [personality] 人格与表达风格、[bot] 昵称，拼进提示词"},
     )
     persona_template: str = Field(
         default="",
@@ -177,8 +208,9 @@ class ReportSection(PluginConfigBase):
         "可用占位符：{bot_name}、{personality}、{reply_style}",
         json_schema_extra={
             "label": "人格提示词模板",
+            "hint": "留空=用内置拼装（昵称/人格/表达风格各一行）；可用占位符 {bot_name}、{personality}、{reply_style}",
             "x-widget": "textarea",
-            "x-textarea-rows": 4,
+            "rows": 4,
             "placeholder": "你是{bot_name}。你的人格设定：{personality}。你的表达风格：{reply_style}",
         },
     )
@@ -187,8 +219,9 @@ class ReportSection(PluginConfigBase):
         description="额外提示词，会追加在人格提示词之后（注入宿主人格关闭时它仍会生效）",
         json_schema_extra={
             "label": "额外提示词",
+            "hint": "追加在人格之后；即使关掉「注入宿主人格」这条也仍然生效",
             "x-widget": "textarea",
-            "x-textarea-rows": 3,
+            "rows": 3,
             "placeholder": "例如：语气活泼一点，最后加一句鼓励的话",
         },
     )
@@ -197,15 +230,16 @@ class ReportSection(PluginConfigBase):
         description="转述任务说明（不含数据本体与人格）；人格会拼在它前面，统计数据会附在它后面",
         json_schema_extra={
             "label": "转述提示词",
+            "hint": "只写任务说明即可；系统会自动把「人格」拼在前面、「统计数据」附在后面",
             "x-widget": "textarea",
-            "x-textarea-rows": 5,
+            "rows": 5,
             "placeholder": "请用自然、口语化的中文把数据转述给群友…",
         },
     )
     send_image: bool = Field(
         default=True,
         description="播报时是否附带图片报告；图片渲染失败会自动改为只发文字并记录一条错误日志",
-        json_schema_extra={"label": "附带图片"},
+        json_schema_extra={"label": "附带图片", "hint": "图片渲染失败时会自动改为只发文字，并记一条错误日志"},
     )
 
 
@@ -219,50 +253,69 @@ class CommandSection(PluginConfigBase):
     enabled: bool = Field(
         default=True,
         description="关闭后 /token 与 /tokens 不再响应（机器人的其他功能不受影响）",
-        json_schema_extra={"label": "启用指令"},
+        json_schema_extra={"label": "启用指令", "hint": "关闭后 /token 与 /tokens 不再响应，其他功能不受影响"},
     )
     permission_mode: Literal["all", "whitelist", "blacklist"] = Field(
         default="all",
         description="群名单制度：决定是否启用群白名单/群黑名单；用户名单在三种模式下都生效",
         json_schema_extra={
             "label": "群名单制度",
-            "x-option-labels": {"all": "不限制", "whitelist": "群白名单", "blacklist": "群黑名单"},
-            "x-option-descriptions": {
-                "all": "不启用群白名单制度（群黑名单仍然生效）",
-                "whitelist": "只有「白名单群号」里的群可用，私聊只能靠用户白名单",
-                "blacklist": "「黑名单群号」里的群不可用，其余群可用",
-            },
+            "hint": "选「不限制」=不启用群白名单（群黑名单仍生效）；选「群白名单」=只有白名单里的群可用；选「群黑名单」=黑名单里的群不可用。用户名单三种制度下都生效，且冲突时黑名单优先",
         },
     )
     whitelist_groups: List[str] = Field(
         default_factory=list,
         description="群白名单：仅在「群白名单」制度下生效；与群黑名单冲突时黑名单优先",
-        json_schema_extra={"label": "白名单群号", "x-widget": "tags", "placeholder": "123456789"},
+        json_schema_extra={
+            **_list_field("123456789", "填群号后点 + 添加；仅在「群白名单」制度下生效"),
+            "label": "白名单群号",
+        },
     )
     whitelist_users: List[str] = Field(
         default_factory=list,
         description="用户白名单：命中的 QQ 号始终可用（优先于群名单）；与用户黑名单冲突时黑名单优先",
-        json_schema_extra={"label": "白名单 QQ 号", "x-widget": "tags", "placeholder": "10001"},
+        json_schema_extra={
+            **_list_field("10001", "填 QQ 号后点 + 添加；命中的用户始终可用（优先于群名单）"),
+            "label": "白名单 QQ 号",
+        },
     )
     blacklist_groups: List[str] = Field(
         default_factory=list,
         description="群黑名单：命中的群在任何制度下都不可用（优先于群白名单）",
-        json_schema_extra={"label": "黑名单群号", "x-widget": "tags", "placeholder": "123456789"},
+        json_schema_extra={
+            **_list_field("123456789", "填群号后点 + 添加；命中的群在任何制度下都不可用"),
+            "label": "黑名单群号",
+        },
     )
     blacklist_users: List[str] = Field(
         default_factory=list,
         description="用户黑名单：命中的 QQ 号始终不可用（最高优先级，高于用户白名单）",
-        json_schema_extra={"label": "黑名单 QQ 号", "x-widget": "tags", "placeholder": "10001"},
+        json_schema_extra={
+            **_list_field("10001", "填 QQ 号后点 + 添加；命中的用户始终不可用（优先级最高）"),
+            "label": "黑名单 QQ 号",
+        },
+    )
+    notify_no_permission: bool = Field(
+        default=True,
+        description="无权限时是否回复提示；关闭后无权限的调用会被静默忽略，不发送任何消息",
+        json_schema_extra={
+            "label": "提示无权限",
+            "hint": "关闭后无权限时完全静默（不发任何消息）；开启时按下面的「无权限提示」内容回复",
+        },
     )
     deny_message: str = Field(
         default="你没有权限使用该指令",
-        description="无权限时的回复内容；留空则不回复（静默拒绝）",
-        json_schema_extra={"label": "无权限提示", "placeholder": "你没有权限使用该指令"},
+        description="无权限时的回复内容；留空则静默拒绝（与「提示无权限」开关任一关闭都不回复）",
+        json_schema_extra={
+            "label": "无权限提示",
+            "hint": "「提示无权限」开启时回复的内容；留空则不回复",
+            "placeholder": "你没有权限使用该指令",
+        },
     )
     use_image: bool = Field(
         default=True,
         description="指令回复是否使用图片渲染；渲染失败会自动改为只发文字并记录一条错误日志",
-        json_schema_extra={"label": "指令使用图片"},
+        json_schema_extra={"label": "指令使用图片", "hint": "渲染失败会自动改为只发文字，并记一条错误日志"},
     )
 
 
@@ -273,18 +326,28 @@ class RenderSection(PluginConfigBase):
     __ui_icon__ = "image"
     __ui_order__ = 5
 
-    template_name: Literal["simple", "dark", "handbook", "rank"] = Field(
+    template_name: str = Field(
         default="simple",
-        description="图片报告的内置模板风格，四种模板显示的数据完全相同，只是配色与排版不同",
+        description="图片报告使用的模板名称：可填 4 个内置名 simple / dark / handbook / rank，"
+        "也可填「自定义模板」里定义的名称；填了不存在的名字会记录一条错误日志并回退 simple",
         json_schema_extra={
             "label": "图片模板",
-            "x-option-labels": {"simple": "简约白卡片", "dark": "深色数据面板", "handbook": "手账便签", "rank": "榜单风"},
-            "x-option-descriptions": {
-                "simple": "白底圆角卡片，适合大多数场景",
-                "dark": "深色背景 + 高亮数字，适合夜间查看",
-                "handbook": "米色纸张 + 衬线字体，偏手账风格",
-                "rank": "深色榜单风，前三名模型有金银铜配色",
-            },
+            "hint": "填 simple / dark / handbook / rank，或「自定义模板」里定义的名称；四种内置模板数据相同、只是配色排版不同",
+            "placeholder": "simple",
+        },
+    )
+    custom_templates: List[str] = Field(
+        default_factory=list,
+        description="自定义图片模板列表，每条格式为「名称|基础样式|主色|页背景色|卡片底色」："
+        "基础样式取 simple / dark / handbook / rank（决定排版与字体），主色必填且为 #RRGGBB，"
+        "页背景色与卡片底色可选（省略则沿用基础样式配色）。添加后在「图片模板」里填该名称即可使用。",
+        json_schema_extra={
+            **_list_field(
+                "我的模板|dark|#5ea0ff|#0b1220|#151f33",
+                "填「名称|基础样式|主色」后点 + 添加（页背景色与卡片底色可选）；基础样式取 simple/dark/handbook/rank，"
+                "颜色写 #RRGGBB；加好后到「图片模板」里填这个名字",
+            ),
+            "label": "自定义模板",
         },
     )
     image_format: Literal["png", "jpeg"] = Field(
@@ -292,11 +355,7 @@ class RenderSection(PluginConfigBase):
         description="图片格式：PNG 无损体积较大，JPEG 体积小、可指定质量",
         json_schema_extra={
             "label": "图片格式",
-            "x-option-labels": {"png": "PNG（无损）", "jpeg": "JPEG（可压缩）"},
-            "x-option-descriptions": {
-                "png": "宿主直接输出的原始格式，不做二次编码",
-                "jpeg": "由插件用 Pillow 转码，配合「JPEG 质量」控制体积",
-            },
+            "hint": "PNG 无损、体积大；JPEG 体积小，可配合下面的「JPEG 质量」调节",
         },
     )
     jpeg_quality: int = Field(
@@ -304,61 +363,81 @@ class RenderSection(PluginConfigBase):
         ge=1,
         le=100,
         description="JPEG 质量（1~100），仅在「图片格式」为 JPEG 时生效；数值越低体积越小、细节越少",
-        json_schema_extra={"label": "JPEG 质量", "x-widget": "slider", "step": 1},
+        json_schema_extra={"label": "JPEG 质量", "hint": "仅当图片格式为 JPEG 时生效；越低体积越小", "x-widget": "slider", "step": 1},
     )
     resolution_scale: float = Field(
         default=2.0,
         ge=1.0,
         le=4.0,
         description="分辨率等级（设备像素比）：越大越清晰、图片越大、渲染越慢；2.0 适合手机查看，3.0+ 适合电脑放大",
-        json_schema_extra={"label": "分辨率等级", "x-widget": "slider", "step": 0.5},
+        json_schema_extra={
+            "label": "分辨率等级",
+            "hint": "越大越清晰也越慢：2.0 适合手机查看，3.0 以上适合电脑放大",
+            "x-widget": "slider",
+            "step": 0.5,
+        },
     )
     first_round_timeout_ms: int = Field(
         default=15000,
         ge=1000,
         le=60000,
         description="第一轮渲染的单次超时（毫秒）：正常渲染通常几秒内完成，超过该时间会切换到下一个字体服务组",
-        json_schema_extra={"label": "第一轮超时", "placeholder": "15000", "step": 1000},
+        json_schema_extra={
+            "label": "第一轮超时",
+            "hint": "单位毫秒；超过就换下一个字体服务组重试",
+            "placeholder": "15000",
+            "step": 1000,
+        },
     )
     second_round_timeout_ms: int = Field(
         default=25000,
         ge=1000,
         le=60000,
         description="第二轮（回退轮）的单次超时（毫秒）：第一轮全部失败后用兜底视口再试一次，可给更长时间",
-        json_schema_extra={"label": "第二轮超时", "placeholder": "25000", "step": 1000},
+        json_schema_extra={
+            "label": "第二轮超时",
+            "hint": "单位毫秒；仅在第一轮全部失败后的兜底轮使用",
+            "placeholder": "25000",
+            "step": 1000,
+        },
     )
     viewport_width: int = Field(
         default=1000,
         ge=200,
         le=3000,
         description="第一轮渲染的浏览器视口宽度（px），一般与报告卡片宽度一致即可",
-        json_schema_extra={"label": "视口宽度", "placeholder": "1000", "step": 50},
+        json_schema_extra={"label": "视口宽度", "hint": "第一轮浏览器视口宽度（px）", "placeholder": "1000", "step": 50},
     )
     viewport_height: int = Field(
         default=600,
         ge=200,
         le=4000,
         description="第一轮渲染的浏览器视口高度（px）；截图按内容自适应，该值主要影响布局换行",
-        json_schema_extra={"label": "视口高度", "placeholder": "600", "step": 50},
+        json_schema_extra={
+            "label": "视口高度",
+            "hint": "主要影响布局换行；截图会按内容自适应高度",
+            "placeholder": "600",
+            "step": 50,
+        },
     )
     fallback_viewport_width: int = Field(
         default=900,
         ge=200,
         le=3000,
         description="报告渲染视口兜底宽度（px）：仅第二轮使用，用于规避第一轮布局导致的高图或超时",
-        json_schema_extra={"label": "兜底视口宽度", "placeholder": "900", "step": 50},
+        json_schema_extra={"label": "兜底视口宽度", "hint": "仅第二轮（回退轮）使用", "placeholder": "900", "step": 50},
     )
     fallback_viewport_height: int = Field(
         default=1200,
         ge=200,
         le=4000,
         description="报告渲染视口兜底高度（px）：仅第二轮使用，通常给一个更高的值让长报告完整渲染",
-        json_schema_extra={"label": "兜底视口高度", "placeholder": "1200", "step": 50},
+        json_schema_extra={"label": "兜底视口高度", "hint": "仅第二轮使用；长报告建议给大一些", "placeholder": "1200", "step": 50},
     )
     allow_network: bool = Field(
         default=True,
         description="是否允许渲染页面访问外部网络；字体服务地址需要联网，关闭后页面只能用系统字体",
-        json_schema_extra={"label": "允许联网渲染"},
+        json_schema_extra={"label": "允许联网渲染", "hint": "字体 CDN 需要联网；关闭后只能用系统字体"},
     )
     font_services: List[str] = Field(
         default=[
@@ -368,20 +447,25 @@ class RenderSection(PluginConfigBase):
         description="字体服务组，按顺序作为优先级；每条格式为「名称|CSS 基地址|静态字体基地址」，"
         "渲染失败会自动切换到下一组重试（整条管线有 45 秒总预算）",
         json_schema_extra={
+            **_list_field(
+                "内地|https://fonts.loli.net|https://gstatic.loli.net",
+                "在输入框填「名称|CSS地址|静态地址」后点 + 添加；按列表顺序作为优先级，渲染失败自动换下一组",
+            ),
             "label": "字体服务组",
-            "x-widget": "tags",
-            "placeholder": "内地|https://fonts.loli.net|https://gstatic.loli.net",
         },
     )
     show_details: bool = Field(
         default=True,
-        description="是否在报告末尾输出详细数据表（模型/模块的调用次数、Token、费用、平均耗时、占比）",
-        json_schema_extra={"label": "输出详细数据表"},
+        description="是否在报告末尾输出模型用量排行表（模型名、Token、调用次数、费用、平均耗时、占比）",
+        json_schema_extra={
+            "label": "输出模型用量排行表",
+            "hint": "开启后图片末尾会带上模型排行表（含 # 名次）；关闭后只保留图表与总览指标。文本报告的 {details} 占位符同样受它控制",
+        },
     )
     anonymize: bool = Field(
         default=False,
         description="开启后「聊天消息分布」扇形图会把群名/昵称替换成 群聊A / 个人用户A，便于对外分享截图",
-        json_schema_extra={"label": "聊天对象匿名化"},
+        json_schema_extra={"label": "聊天对象匿名化", "hint": "开启后扇形图里显示「群聊A / 个人用户A」，便于对外截图"},
     )
 
 
@@ -394,16 +478,19 @@ class ChartSection(PluginConfigBase):
 
     bar_granularity: Literal["hour", "day", "week", "month"] = Field(
         default="day",
-        description="条形图横轴颗粒度：决定每根柱子代表多长时间；小时档只回溯最近 32 天，其余档回溯最近 365 天",
+        description="条形图横轴颗粒度：决定每根柱子代表多长时间；小时档只回溯最近 32 天，其余档回溯 365 天",
         json_schema_extra={
             "label": "条形图颗粒度",
-            "x-option-labels": {"hour": "按小时", "day": "按天", "week": "按周", "month": "按月"},
-            "x-option-descriptions": {
-                "hour": "每根柱 = 1 小时，适合看最近一两天的波动",
-                "day": "每根柱 = 1 天，日常查看的推荐档位",
-                "week": "每根柱 = 1 周（由天数据合并）",
-                "month": "每根柱 = 1 个月（由天数据合并）",
-            },
+            "hint": "每根柱子代表多长时间：小时档只回溯 32 天，天/周/月档回溯 365 天",
+        },
+    )
+    chart_style: Literal["bar", "line", "bar_line"] = Field(
+        default="bar_line",
+        description="趋势图的图形样式：bar=仅条形图，line=仅平滑曲线，bar_line=条形图叠加平滑曲线",
+        json_schema_extra={
+            "label": "趋势图样式",
+            "hint": "可选 bar（仅条形）/ line（仅曲线）/ bar_line（条形+曲线叠加，默认）：叠加时条形半透明、"
+            "曲线为平滑曲线并带数据点；五个趋势图（Token/总花费/各模型/各模块/各聊天流）统一生效",
         },
     )
     bar_days: int = Field(
@@ -411,64 +498,74 @@ class ChartSection(PluginConfigBase):
         ge=1,
         le=365,
         description="条形图横轴回溯范围（天）：只显示最近这些天的数据，越大图越密",
-        json_schema_extra={"label": "横轴范围（天）", "placeholder": "30", "step": 1},
+        json_schema_extra={"label": "横轴范围（天）", "hint": "只显示最近这些天的数据，越大柱子越密", "placeholder": "30", "step": 1},
     )
     series_top: int = Field(
         default=5,
         ge=1,
         le=20,
         description="多序列图（各模型/各模块/各聊天流）显示前 N 个序列，其余合并成「其他」，避免图例过长",
-        json_schema_extra={"label": "多序列显示条数", "x-widget": "slider", "step": 1},
+        json_schema_extra={
+            "label": "多序列显示条数",
+            "hint": "多序列图只画前 N 个，其余合并成「其他」，避免图例过长",
+            "x-widget": "slider",
+            "step": 1,
+        },
     )
     bar_tokens: bool = Field(
         default=True,
         description="「Token 趋势」条形图：横轴时间、纵轴 Token 总量",
-        json_schema_extra={"label": "条形图：Token 趋势"},
+        json_schema_extra={"label": "条形图：Token 趋势", "hint": "横轴时间、纵轴 Token 总量"},
     )
     bar_cost: bool = Field(
         default=True,
         description="「总花费趋势」条形图：横轴时间、纵轴花费（元）",
-        json_schema_extra={"label": "条形图：总花费趋势"},
+        json_schema_extra={"label": "条形图：总花费趋势", "hint": "横轴时间、纵轴花费（元）"},
     )
     bar_model_cost: bool = Field(
         default=True,
         description="「各模型花费趋势」多序列条形图：每个模型一个序列，前 N 个之外归入「其他」",
-        json_schema_extra={"label": "条形图：各模型花费趋势"},
+        json_schema_extra={"label": "条形图：各模型花费趋势", "hint": "每个模型一条序列；序列条数见上方「多序列显示条数」"},
     )
     bar_module_cost: bool = Field(
         default=True,
         description="「各模块花费趋势」多序列条形图；每个模块需要一次额外查询，模块个数由「读取上限-模块花费统计个数」控制",
-        json_schema_extra={"label": "条形图：各模块花费趋势"},
+        json_schema_extra={"label": "条形图：各模块花费趋势", "hint": "每个模块要额外查询一次；模块个数见「读取上限」分节"},
     )
     bar_chat_messages: bool = Field(
         default=True,
         description="「各聊天流消息数趋势」多序列条形图：展示各群/各用户的每日消息量",
-        json_schema_extra={"label": "条形图：各聊天流消息数趋势"},
+        json_schema_extra={"label": "条形图：各聊天流消息数趋势", "hint": "展示各群/各用户每天的发言条数"},
     )
     pie_module_tokens: bool = Field(
         default=True,
         description="「模块 Token 占比」扇形图：计划器/回复器/图片/记忆/表情/插件/其他 的 Token 与请求占比",
-        json_schema_extra={"label": "扇形图：模块 Token 占比"},
+        json_schema_extra={"label": "扇形图：模块 Token 占比", "hint": "展示 计划器/回复器/图片/记忆/表情/插件/其他 各占多少"},
     )
     pie_module_cost: bool = Field(
         default=True,
         description="「模块花费分布」扇形图：各模块的花费占比（只统计 Token 排名靠前的模块）",
-        json_schema_extra={"label": "扇形图：模块花费分布"},
+        json_schema_extra={"label": "扇形图：模块花费分布", "hint": "各模块花费占比；只统计 Token 靠前的若干模块"},
     )
     pie_model_tokens: bool = Field(
         default=True,
         description="「模型 Token 占比」扇形图：各模型的 Token 占比",
-        json_schema_extra={"label": "扇形图：模型 Token 占比"},
+        json_schema_extra={"label": "扇形图：模型 Token 占比", "hint": "各模型 Token 占比（显示别名）"},
     )
     pie_model_cost: bool = Field(
         default=True,
         description="「模型花费分布」扇形图：各模型的花费占比",
-        json_schema_extra={"label": "扇形图：模型花费分布"},
+        json_schema_extra={"label": "扇形图：模型花费分布", "hint": "各模型花费占比（显示别名）"},
+    )
+    pie_model_requests: bool = Field(
+        default=True,
+        description="「模型调用量分布」扇形图：各模型被调用次数的占比",
+        json_schema_extra={"label": "扇形图：模型调用量分布", "hint": "各模型被调用次数占比（显示别名）；看哪个模型用得最频繁"},
     )
     pie_chat_messages: bool = Field(
         default=True,
         description="「聊天消息分布」扇形图：各群/各用户的消息量占比（受「聊天对象匿名化」影响）",
-        json_schema_extra={"label": "扇形图：聊天消息分布"},
+        json_schema_extra={"label": "扇形图：聊天消息分布", "hint": "各群/各用户消息量占比；受「聊天对象匿名化」影响"},
     )
 
 
@@ -482,32 +579,65 @@ class ModuleGroupSection(PluginConfigBase):
     planner: List[str] = Field(
         default=["planner", "maisaka.plan", "plan"],
         description="归入「计划器」的模块名前缀；宿主模块名是请求类型中第一个「.」之前的部分",
-        json_schema_extra={"label": "计划器", "x-widget": "tags", "placeholder": "planner"},
+        json_schema_extra={
+            **_list_field("planner", "填模块名前缀后点 + 添加；命中即归入「计划器」"),
+            "label": "计划器",
+        },
     )
     replyer: List[str] = Field(
-        default=["replyer", "maisaka.replyer", "response.splitter"],
+        default=["replyer", "maisaka.replyer", "response.splitter", "reply", "response", "smart_segmentation"],
         description="归入「回复器」的模块名前缀",
-        json_schema_extra={"label": "回复器", "x-widget": "tags", "placeholder": "replyer"},
+        json_schema_extra={
+            **_list_field("replyer", "填模块名前缀后点 + 添加；命中即归入「回复器」"),
+            "label": "回复器",
+        },
     )
     image: List[str] = Field(
         default=["image", "vlm", "A_Memorix.ImageEmbedding"],
         description="归入「图片」的模块名前缀（含图片理解与向量化）",
-        json_schema_extra={"label": "图片", "x-widget": "tags", "placeholder": "image"},
+        json_schema_extra={
+            **_list_field("image", "填模块名前缀后点 + 添加；命中即归入「图片」"),
+            "label": "图片",
+        },
     )
     memory: List[str] = Field(
-        default=["memory", "A_Memorix", "maisaka", "heuristic_memory_impression", "memory_feedback_correction"],
-        description="归入「记忆」的模块名前缀",
-        json_schema_extra={"label": "记忆", "x-widget": "tags", "placeholder": "memory"},
+        default=[
+            "memory",
+            "A_Memorix",
+            "maisaka",
+            "heuristic_memory_impression",
+            "memory_feedback_correction",
+            "memories",
+            "person_fact_writeback",
+            "chat_history_summarizer",
+            "dream",
+            "story",
+            "expression",
+            "jargon",
+            "behavior",
+            "embedding",
+        ],
+        description="归入「记忆」的模块名前缀（含记忆读写与表达/黑话/行为等学习任务）",
+        json_schema_extra={
+            **_list_field("memory", "填模块名前缀后点 + 添加；命中即归入「记忆」"),
+            "label": "记忆",
+        },
     )
     emoji: List[str] = Field(
         default=["emoji"],
         description="归入「表情」的模块名前缀",
-        json_schema_extra={"label": "表情", "x-widget": "tags", "placeholder": "emoji"},
+        json_schema_extra={
+            **_list_field("emoji", "填模块名前缀后点 + 添加；命中即归入「表情」"),
+            "label": "表情",
+        },
     )
     plugin: List[str] = Field(
         default=["plugin", "mcp_sampling"],
         description="归入「插件」的模块名前缀；本插件自己的调用也会记为 plugin.<插件 ID> 并归到这里",
-        json_schema_extra={"label": "插件", "x-widget": "tags", "placeholder": "plugin"},
+        json_schema_extra={
+            **_list_field("plugin", "填模块名前缀后点 + 添加；本插件的调用也归入「插件」"),
+            "label": "插件",
+        },
     )
 
 
@@ -524,21 +654,36 @@ class LimitsSection(PluginConfigBase):
         le=200000,
         description="会话维度（当前对话/指定群/指定用户）明细的最大读取行数；"
         "超出时直接报错放弃统计（不会给出被截断的数字），可按需调大",
-        json_schema_extra={"label": "会话明细行数上限", "placeholder": "20000", "step": 1000},
+        json_schema_extra={
+            "label": "会话明细行数上限",
+            "hint": "会话维度读明细的行数上限；超出会直接报错，不会给出被截断的数字",
+            "placeholder": "20000",
+            "step": 1000,
+        },
     )
     top_models: int = Field(
         default=20,
         ge=1,
         le=50,
         description="模型排行与多序列图显示的模型条数；宿主统计能力上线为 50",
-        json_schema_extra={"label": "模型显示条数", "x-widget": "slider", "step": 1},
+        json_schema_extra={
+            "label": "模型显示条数",
+            "hint": "模型排行与多序列图显示多少条；宿主上限 50",
+            "x-widget": "slider",
+            "step": 1,
+        },
     )
     top_modules: int = Field(
         default=8,
         ge=1,
         le=20,
         description="模块花费统计覆盖的模块个数；每多一个模块会多一次宿主查询，过大将拖慢报告生成",
-        json_schema_extra={"label": "模块花费统计个数", "x-widget": "slider", "step": 1},
+        json_schema_extra={
+            "label": "模块花费统计个数",
+            "hint": "每多一个模块多一次查询，过大将拖慢报告生成",
+            "x-widget": "slider",
+            "step": 1,
+        },
     )
 
 

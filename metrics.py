@@ -24,6 +24,45 @@ UNKNOWN_GROUP_NAME = "其他"
 
 MODULE_GROUP_ORDER: Tuple[str, ...] = ("计划器", "回复器", "图片", "记忆", "表情", "插件")
 
+CHAT_GROUP_NAMES: Tuple[str, ...] = ("计划器", "回复器")
+"""聊天链路的模块分组（对应宿主 ``task_name`` 里的 replyer / planner）。
+
+其余分组（记忆 / 图片 / 表情 / 插件）是后台流水线（记忆抽取、embedding、视觉理解等），
+不随聊天量走，因此报告会把「聊天链路」单独标出来，便于与直觉或宿主页面口径对齐。
+"""
+
+WINDOW_ALIASES: Dict[str, str] = {
+    "today": "today",
+    "今日": "today",
+    "今天": "today",
+    "本日": "today",
+    "this_week": "this_week",
+    "本周": "this_week",
+    "这周": "this_week",
+    "this_month": "this_month",
+    "本月": "this_month",
+    "这个月": "this_month",
+    "last_24h": "last_24h",
+    "24h": "last_24h",
+    "24小时": "last_24h",
+    "最近24小时": "last_24h",
+    "一天": "last_24h",
+    "last_7d": "last_7d",
+    "7d": "last_7d",
+    "7天": "last_7d",
+    "7×24": "last_7d",
+    "最近7天": "last_7d",
+    "一周": "last_7d",
+    "last_30d": "last_30d",
+    "30d": "last_30d",
+    "30天": "last_30d",
+    "最近30天": "last_30d",
+    "一个月": "last_30d",
+}
+"""时间窗口别名表：指令与工具里都可使用中文或英文写法。"""
+
+WINDOW_USAGE_HINT = "今日 / 本周 / 本月 / 最近24小时 / 最近7天 / 最近30天"
+
 SCOPE_LABELS: Dict[str, str] = {
     "all": "全部会话",
     "current": "当前对话",
@@ -122,6 +161,8 @@ class ReportMetrics:
     messages: Optional[int] = None
     replies: Optional[int] = None
     online_hours: Optional[float] = None
+    chat_tokens: Optional[int] = None
+    """聊天链路（计划器 + 回复器）的 Token 合计；其余 Token 来自后台流水线。"""
     bars: Dict[str, SeriesData] = field(default_factory=dict)
     pies: Dict[str, List[PieSlice]] = field(default_factory=dict)
     models: List[ModelUsageRow] = field(default_factory=list)
@@ -129,6 +170,14 @@ class ReportMetrics:
     chats: List[ChatMessageRow] = field(default_factory=list)
     unavailable: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
+    chart_granularity: str = ""
+    """本次趋势图实际使用的颗粒度；为空时按配置的 ``chart.bar_granularity`` 处理。"""
+    window_scoped: bool = False
+    """是否只统计单个时间窗口。
+
+    为 True 时数据层已经只采集该窗口的数据（窗口、趋势图、模型排行、占比分布
+    口径一致），渲染侧只需隐藏与窗口数字重复的「总计」行。
+    """
 
     @property
     def received_messages(self) -> Optional[int]:
@@ -382,7 +431,12 @@ def limit_series_top(series_data: SeriesData, top_count: int) -> SeriesData:
             if index < len(others_values):
                 others_values[index] += float(value or 0)
     limited["其他"] = others_values
-    return SeriesData(labels=series_data.labels, series=limited, unit_label=series_data.unit_label)
+    return SeriesData(
+        labels=series_data.labels,
+        series=limited,
+        unit_label=series_data.unit_label,
+        value_formatter=series_data.value_formatter,
+    )
 
 
 def parse_timestamp(raw_value: object) -> Optional[datetime]:
@@ -500,6 +554,42 @@ def ordered_group_items(values: Dict[str, float]) -> List[Tuple[str, float]]:
             continue
         ordered.append((group_name, value))
     return ordered
+
+
+def normalize_window_key(text: object) -> Optional[str]:
+    """把用户输入的时间说法解析为窗口 key。
+
+    Args:
+        text: 用户输入，例如 ``今日``、``today``、``7天``、``last_24h``。
+
+    Returns:
+        Optional[str]: 命中的窗口 key；无法识别时返回 None。
+    """
+
+    normalized = str(text or "").strip().lower()
+    if not normalized:
+        return None
+    return WINDOW_ALIASES.get(normalized)
+
+
+def model_token_total(metrics: "ReportMetrics") -> float:
+    """返回全部模型的 Token 合计，用于计算「占比」列。
+
+    优先取占比图里的完整模型清单：``metrics.models`` 只保留配置的显示条数，
+    直接拿它求和会让占比虚高（被截断的模型被算丢了）。
+
+    Args:
+        metrics: 指标快照。
+
+    Returns:
+        float: Token 合计；完全无数据时返回 1.0（避免除零）。
+    """
+
+    slices = metrics.pies.get("model_tokens") or []
+    total = sum(float(item.value) for item in slices)
+    if total > 0:
+        return total
+    return float(sum(row.tokens for row in metrics.models)) or 1.0
 
 
 def build_scope_name(scope: str, target_label: str = "") -> str:

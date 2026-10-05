@@ -19,7 +19,11 @@ from maibot_sdk.types import ToolParameterInfo, ToolParamType
 from .config_model import TokenUsageReportConfig
 from .data_sources import collect_global_metrics
 from .delivery import broadcast_report, describe_targets, send_report
-from .metrics import WINDOW_ORDER, ReportMetrics
+from .metrics import (
+    WINDOW_USAGE_HINT,
+    ReportMetrics,
+    normalize_window_key,
+)
 from .renderer import build_report_image
 from .session_stats import SessionStatsError, collect_session_metrics
 from .text_report import build_report_text, build_short_window_text, render_text_report
@@ -27,8 +31,25 @@ from .text_report import build_report_text, build_short_window_text, render_text
 logger = logging.getLogger(__name__)
 
 _VALID_SCOPES = ("all", "current", "group", "user")
-_SCOPE_ALIASES = {"全": "all", "全部": "all", "当前": "current", "群": "group", "用户": "user"}
-_USAGE_TEXT = "用法：/token（当前对话）、/token all（全部会话）、/token 群 <群号>、/token 用户 <QQ号>"
+_SCOPE_ALIASES = {
+    "全": "all",
+    "全部": "all",
+    "全局": "all",
+    "所有": "all",
+    "当前": "current",
+    "本群": "current",
+    "群": "group",
+    "群聊": "group",
+    "用户": "user",
+    "个人": "user",
+    "私聊": "user",
+}
+_USAGE_TEXT = (
+    "用法：/token [范围] [时间]\n"
+    "范围：留空=当前对话，all=全部会话，群 <群号>，用户 <QQ号>\n"
+    f"时间：留空=全部窗口，可填 {WINDOW_USAGE_HINT}\n"
+    "示例：/token、/token 今日、/token all 本周、/token 群 123456 最近7天、/token 用户 10001 30天"
+)
 _IDLE_WAIT_SECONDS = 60.0
 
 
@@ -88,7 +109,8 @@ class TokenUsageReportPlugin(MaiBotPlugin):
         description=(
             "查询 Bot 自身消耗的 token 用量。scope 可选：all=全部会话（默认）、current=当前对话"
             "（需传 stream_id）、group=指定群聊（需传 target_id 群号）、user=指定用户（需传 target_id QQ 号）；"
-            "window 可选 today/this_week/this_month/last_24h/last_7d/last_30d，留空返回全部窗口。"
+            f"window 可选 {WINDOW_USAGE_HINT}（也支持 today/this_week/this_month/last_24h/last_7d/last_30d），"
+            "留空返回全部窗口。"
         ),
         parameters=[
             ToolParameterInfo(
@@ -115,7 +137,7 @@ class TokenUsageReportPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="window",
                 param_type=ToolParamType.STRING,
-                description="时间窗口，留空返回全部窗口",
+                description="时间窗口，可填 今日/本周/本月/最近24小时/最近7天/最近30天 或对应英文名，留空返回全部窗口",
                 required=False,
                 default="",
             ),
@@ -137,14 +159,23 @@ class TokenUsageReportPlugin(MaiBotPlugin):
             return {"success": False, "content": f"不支持的统计范围：{scope}（可选 {'/'.join(_VALID_SCOPES)}）"}
 
         window_key = str(window or "").strip().lower()
-        if window_key and window_key != "all" and window_key not in WINDOW_ORDER:
-            return {"success": False, "content": f"不支持的时间范围：{window}（可选 {', '.join(WINDOW_ORDER)}）"}
+        if window_key and window_key != "all":
+            matched_window = normalize_window_key(window_key)
+            if matched_window is None:
+                return {
+                    "success": False,
+                    "content": f"不支持的时间范围：{window}（可填 {WINDOW_USAGE_HINT}）",
+                }
+            window_key = matched_window
+        elif window_key == "all":
+            window_key = ""
 
         try:
             metrics = await self._collect_metrics(
                 scope=normalized_scope,
                 stream_id=stream_id,
                 target_id=target_id,
+                window_key=window_key,
             )
         except SessionStatsError as exc:
             return {"success": False, "content": str(exc)}
@@ -163,7 +194,7 @@ class TokenUsageReportPlugin(MaiBotPlugin):
                 for window_item in metrics.ordered_windows()
             },
             "total": None
-            if metrics.total is None
+            if metrics.total is None or metrics.window_scoped
             else {
                 "tokens": metrics.total.tokens,
                 "requests": metrics.total.requests,
@@ -178,8 +209,13 @@ class TokenUsageReportPlugin(MaiBotPlugin):
 
     @Command(
         "token_usage",
-        description="统计 Bot 的 Token 消耗（当前对话 / 全部 / 指定群 / 指定用户）",
-        pattern=r"^/(?:token|tokens)(?:\s+(?P<arg1>\S+))?(?:\s+(?P<arg2>\S+))?$",
+        description="统计 Bot 的 Token 消耗（可指定范围与时间，例如 /token all 今日、/token 群 123456 本周）",
+        pattern=(
+            r"^/(?:token|tokens)"
+            r"(?:\s+(?P<arg1>\S+))?"
+            r"(?:\s+(?P<arg2>\S+))?"
+            r"(?:\s+(?P<arg3>\S+))?$"
+        ),
     )
     async def handle_token_command(
         self,
@@ -199,18 +235,18 @@ class TokenUsageReportPlugin(MaiBotPlugin):
             user_id=user_id,
             is_local_operator=bool(is_local_operator),
         ):
-            deny_message = str(self.config.command.deny_message or "").strip()
-            if deny_message:
-                await self.ctx.send.text(deny_message, stream_id)
+            await self._notify_no_permission(stream_id)
             return True, "无权限", True
 
-        scope, target_id, error_message = self._parse_command_args(kwargs)
+        scope, target_id, window_key, error_message = self._parse_command_args(kwargs)
         if error_message:
             await self.ctx.send.text(error_message, stream_id)
             return False, error_message, True
 
         try:
-            metrics = await self._collect_metrics(scope=scope, stream_id=stream_id, target_id=target_id)
+            metrics = await self._collect_metrics(
+                scope=scope, stream_id=stream_id, target_id=target_id, window_key=window_key
+            )
         except SessionStatsError as exc:
             await self.ctx.send.text(str(exc), stream_id)
             return False, str(exc), True
@@ -227,38 +263,109 @@ class TokenUsageReportPlugin(MaiBotPlugin):
             if image_base64 is None:
                 logger.error("[token_usage_report] 指令图片渲染失败，已回退为文字版本：%s", render_error)
 
-        sent = await send_report(self.ctx, stream_id, text_report, image_base64)
+        sent = await send_report(
+            self.ctx,
+            stream_id,
+            self._text_for_delivery(text_report, has_image=image_base64 is not None),
+            image_base64,
+        )
         if not sent:
             return False, "统计结果发送失败", True
         return True, "已发送 Token 统计", True
 
-    def _parse_command_args(self, kwargs: Dict[str, Any]) -> Tuple[str, str, str]:
-        """解析指令参数，返回 ``(scope, target_id, 错误提示)``。"""
+    def _text_for_delivery(self, text: str, *, has_image: bool) -> str:
+        """决定是否随图片一起发送文字。
+
+        图片渲染成功时，模板文字与图片内容重复，不再发送；LLM 风格化转述的内容
+        与图片不同，仍然照常发送。图片不可用时文字是唯一的载体，必须发送。
+
+        Args:
+            text: 待发送的文本。
+            has_image: 本次是否拿到了可发送的图片。
+
+        Returns:
+            str: 实际要发送的文本（空串表示只发图片）。
+        """
+
+        if has_image and self.config.report.mode != "llm":
+            return ""
+        return text
+
+    def _parse_command_args(self, kwargs: Dict[str, Any]) -> Tuple[str, str, str, str]:
+        """解析指令参数，返回 ``(scope, target_id, window_key, 错误提示)``。
+
+        参数顺序不限，时间窗口可与范围参数混用，例如：``/token``、
+        ``/token all``、``/token 今日``、``/token all 今日``、
+        ``/token 群 123456 本周``、``/token 用户 10001 7天``。
+        ``群`` / ``用户`` 后面的第一个参数一律当作目标值，不会被误判成时间窗口。
+        """
+
+        scope = "current"
+        target_id = ""
+        window_key = ""
+        expect_target = False
+        for arg in self._collect_command_args(kwargs):
+            if expect_target:
+                target_id = arg
+                expect_target = False
+                continue
+
+            normalized_scope = _SCOPE_ALIASES.get(arg.lower(), _SCOPE_ALIASES.get(arg, arg.lower()))
+            if normalized_scope in {"group", "user"}:
+                if scope in {"group", "user"}:
+                    return "", "", "", f"重复指定了范围。{_USAGE_TEXT}"
+                scope = normalized_scope
+                expect_target = True
+                continue
+            if normalized_scope in {"all", "current"}:
+                if scope != "current" or target_id:
+                    return "", "", "", f"重复指定了范围。{_USAGE_TEXT}"
+                scope = normalized_scope
+                continue
+
+            matched_window = normalize_window_key(arg)
+            if matched_window:
+                if window_key:
+                    return "", "", "", f"只能指定一个时间范围。{_USAGE_TEXT}"
+                window_key = matched_window
+                continue
+
+            return "", "", "", f"无法识别的参数「{arg}」。{_USAGE_TEXT}"
+
+        if expect_target:
+            return "", "", "", f"缺少目标：{_USAGE_TEXT}"
+        return scope, target_id, window_key, ""
+
+    @staticmethod
+    def _collect_command_args(kwargs: Dict[str, Any]) -> List[str]:
+        """从指令回调参数中取出位置参数列表（优先取正则捕获组）。"""
 
         matched_groups = kwargs.get("matched_groups")
-        arg1 = ""
-        arg2 = ""
         if isinstance(matched_groups, dict):
-            arg1 = str(matched_groups.get("arg1") or "").strip()
-            arg2 = str(matched_groups.get("arg2") or "").strip()
-        if not arg1:
-            raw_text = str(kwargs.get("text") or "").strip()
-            parts = raw_text.split()
-            if len(parts) >= 2:
-                arg1 = parts[1]
-            if len(parts) >= 3:
-                arg2 = parts[2]
+            collected = [
+                str(matched_groups.get(name) or "").strip()
+                for name in ("arg1", "arg2", "arg3")
+                if str(matched_groups.get(name) or "").strip()
+            ]
+            if collected:
+                return collected
 
-        if not arg1:
-            return "current", "", ""
-        normalized_arg = _SCOPE_ALIASES.get(arg1.lower(), _SCOPE_ALIASES.get(arg1, arg1.lower()))
-        if normalized_arg == "all":
-            return "all", "", ""
-        if normalized_arg in {"group", "user"}:
-            if not arg2:
-                return "", "", f"缺少目标：{_USAGE_TEXT}"
-            return normalized_arg, arg2, ""
-        return "", "", f"无法识别的参数「{arg1}」。{_USAGE_TEXT}"
+        raw_text = str(kwargs.get("text") or "").strip()
+        return raw_text.split()[1:] if raw_text.split() else []
+
+    async def _notify_no_permission(self, stream_id: str) -> None:
+        """按配置决定是否回复「无权限」提示。
+
+        ``command.notify_no_permission`` 关闭时完全静默；
+        开启但 ``deny_message`` 为空时同样不回复（把提示文案留空即静默拒绝）。
+        """
+
+        if not self.config.command.notify_no_permission:
+            return
+        deny_message = str(self.config.command.deny_message or "").strip()
+        if not deny_message:
+            return
+        await self.ctx.send.text(deny_message, stream_id)
 
     def _check_command_permission(self, *, group_id: str, user_id: str, is_local_operator: bool) -> bool:
         """按配置判断指令调用者是否有权限。
@@ -386,16 +493,28 @@ class TokenUsageReportPlugin(MaiBotPlugin):
             if image_base64 is None:
                 logger.error("[token_usage_report] 播报图片渲染失败，已回退为文字版本：%s", render_error)
 
-        success_count, failure_count = await broadcast_report(self.ctx, self.config, text_report, image_base64)
+        success_count, failure_count = await broadcast_report(
+            self.ctx,
+            self.config,
+            self._text_for_delivery(text_report, has_image=image_base64 is not None),
+            image_base64,
+        )
         logger.info("[token_usage_report] 定时播报完成：成功 %d 个目标，失败 %d 个目标", success_count, failure_count)
 
     # ──── 共用 ────
 
-    async def _collect_metrics(self, *, scope: str, stream_id: str = "", target_id: str = "") -> ReportMetrics:
-        """按统计范围采集指标。"""
+    async def _collect_metrics(
+        self,
+        *,
+        scope: str,
+        stream_id: str = "",
+        target_id: str = "",
+        window_key: str = "",
+    ) -> ReportMetrics:
+        """按统计范围采集指标；``window_key`` 非空时整份报告只覆盖该窗口。"""
 
         if scope == "all":
-            return await collect_global_metrics(self.ctx, self.config)
+            return await collect_global_metrics(self.ctx, self.config, window_key)
         return await collect_session_metrics(
             self.ctx,
             self.config,
@@ -403,6 +522,7 @@ class TokenUsageReportPlugin(MaiBotPlugin):
             stream_id=stream_id,
             target_id=target_id,
             platform=self.config.report.platform,
+            window_key=window_key,
         )
 
 

@@ -9,7 +9,12 @@ import time
 
 from .config_model import TokenUsageReportConfig
 from .metrics import ReportMetrics
-from .templates import FontService, build_html, parse_font_services
+from .templates import (
+    FontService,
+    build_html,
+    parse_font_services,
+    resolve_theme,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -106,17 +111,29 @@ async def _render_once(
     """
 
     html = build_html(metrics, config, service)
+    render_kwargs: Dict[str, Any] = {
+        "selector": _RENDER_SELECTOR,
+        "viewport": {"width": viewport_width, "height": viewport_height},
+        "device_scale_factor": config.render.resolution_scale,
+        "full_page": False,
+        "wait_until": "load",
+        "allow_network": config.render.allow_network,
+    }
     try:
-        result = await ctx.render.html2png(
-            html,
-            selector=_RENDER_SELECTOR,
-            viewport={"width": viewport_width, "height": viewport_height},
-            device_scale_factor=config.render.resolution_scale,
-            full_page=False,
-            wait_until="load",
-            allow_network=config.render.allow_network,
-            timeout_ms=timeout_ms,
-        )
+        result = await ctx.render.html2png(html, render_timeout_ms=timeout_ms, **render_kwargs)
+    except TypeError as exc:
+        # 新版 SDK 用 render_timeout_ms 表示渲染业务超时，旧版用 timeout_ms，按参数名兼容
+        if "render_timeout_ms" not in str(exc):
+            logger.warning("[token_usage_report] 渲染失败（第%d轮 / 字体服务 %s）：%s", round_index, service.name, exc)
+            return None, str(exc)
+        logger.info("[token_usage_report] 当前插件 SDK 使用旧参数名 timeout_ms，已自动按旧版重试")
+        try:
+            result = await ctx.render.html2png(html, timeout_ms=timeout_ms, **render_kwargs)
+        except Exception as inner_exc:
+            logger.warning(
+                "[token_usage_report] 渲染失败（第%d轮 / 字体服务 %s）：%s", round_index, service.name, inner_exc
+            )
+            return None, str(inner_exc)
     except Exception as exc:
         logger.warning("[token_usage_report] 渲染失败（第%d轮 / 字体服务 %s）：%s", round_index, service.name, exc)
         return None, str(exc)
@@ -133,8 +150,11 @@ async def _render_once(
         return None, f"图片格式转换失败：{exc}"
 
     render_ms = result.get("render_ms") if isinstance(result, dict) else None
+    resolved_theme, resolved_name = resolve_theme(config)
+    del resolved_theme
     logger.info(
-        "[token_usage_report] 报告图片渲染成功：模板=%s，字体服务=%s，第%d轮，格式=%s，耗时=%s",
+        "[token_usage_report] 报告图片渲染成功：模板=%s（配置值 %s），字体服务=%s，第%d轮，格式=%s，耗时=%s",
+        resolved_name,
         config.render.template_name,
         service.name,
         round_index,

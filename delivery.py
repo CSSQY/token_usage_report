@@ -119,10 +119,13 @@ async def send_report(
 ) -> bool:
     """向指定聊天流发送报告（先图片后文本）。
 
+    调用方通过 ``text`` 是否为空来决定要不要同时发文字：图片渲染成功且文字与图片内容
+    重复时传空串即可只发图片；``image_base64`` 为空时则只发文本。
+
     Args:
         ctx: 插件运行时上下文。
         stream_id: 目标聊天流 ID。
-        text: 文本内容。
+        text: 文本内容；为空时只发图片。
         image_base64: 图片 base64；为空时只发文本。
 
     Returns:

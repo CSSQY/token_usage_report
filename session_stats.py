@@ -11,6 +11,7 @@ import logging
 
 from .config_model import TokenUsageReportConfig, build_model_alias_map, build_module_group_map
 from .metrics import (
+    CHAT_GROUP_NAMES,
     WINDOW_LABELS,
     WINDOW_ORDER,
     ModelUsageRow,
@@ -44,6 +45,7 @@ async def collect_session_metrics(
     stream_id: str = "",
     target_id: str = "",
     platform: str = "",
+    window_key: str = "",
 ) -> ReportMetrics:
     """采集会话维度（当前对话 / 指定群聊 / 指定用户）的统计指标。
 
@@ -54,6 +56,7 @@ async def collect_session_metrics(
         stream_id: 当前对话的聊天流 ID（``scope=current`` 时使用）。
         target_id: 指定群号或 QQ 号。
         platform: 平台标识。
+        window_key: 只统计单个时间窗口时传入窗口 key；留空表示统计全部窗口。
 
     Returns:
         ReportMetrics: 会话维度指标快照。
@@ -63,7 +66,9 @@ async def collect_session_metrics(
     """
 
     collector = _SessionCollector(ctx=ctx, config=config, platform=platform or config.report.platform)
-    return await collector.collect(scope=scope, stream_id=stream_id, target_id=target_id)
+    return await collector.collect(
+        scope=scope, stream_id=stream_id, target_id=target_id, window_key=window_key
+    )
 
 
 class _SessionCollector:
@@ -77,17 +82,27 @@ class _SessionCollector:
         self._alias_map = build_model_alias_map(config.model_aliases.aliases)
         self._module_group_map = build_module_group_map(config.module_groups)
 
-    async def collect(self, *, scope: str, stream_id: str, target_id: str) -> ReportMetrics:
+    async def collect(
+        self,
+        *,
+        scope: str,
+        stream_id: str,
+        target_id: str,
+        window_key: str = "",
+    ) -> ReportMetrics:
         """解析会话并完成明细聚合。"""
 
         session_id, target_label = await self._resolve_session(scope=scope, stream_id=stream_id, target_id=target_id)
         rows = await self._load_rows(session_id)
 
+        predicates = build_window_predicates(self._now)
+        selected_window = window_key if window_key in predicates else ""
         metrics = ReportMetrics(
             scope=scope,
             scope_name=build_scope_name(scope, target_label),
             generated_at=self._now,
             unit_name=self._config.token_unit.unit_name,
+            window_scoped=bool(selected_window),
         )
         metrics.notes = [
             "总计口径：该会话的全部历史记录（受 limits.max_session_rows 行数上限约束）",
@@ -95,7 +110,15 @@ class _SessionCollector:
             "会话视图不包含消息数 / 回复数 / 在线时长（宿主无按会话过滤这些指标的能力）",
         ]
         metrics.total_scope_note = "该会话全部历史记录"
-        self._fill_metrics(metrics, rows)
+        if selected_window:
+            label = WINDOW_LABELS[selected_window]
+            metrics.scope_name = f"{metrics.scope_name} · {label}"
+            metrics.total_scope_note = label
+            metrics.notes = [
+                f"本次报告只统计「{label}」：窗口、趋势图、模型排行与占比分布均为该窗口数据",
+                *metrics.notes[1:],
+            ]
+        self._fill_metrics(metrics, rows, window_key=selected_window)
         return metrics
 
     # ──── 会话解析与明细读取 ────
@@ -187,17 +210,30 @@ class _SessionCollector:
 
     # ──── 明细聚合 ────
 
-    def _fill_metrics(self, metrics: ReportMetrics, rows: List[Dict[str, Any]]) -> None:
-        """把明细行聚合为窗口指标、图表数据与模型/模块占比。"""
+    def _fill_metrics(self, metrics: ReportMetrics, rows: List[Dict[str, Any]], window_key: str = "") -> None:
+        """把明细行聚合为窗口指标、图表数据与模型/模块占比。
+
+        ``window_key`` 非空时先丢弃窗口外的明细行，因此总计、模型排行、模块占比、
+        趋势图都会只覆盖该窗口。
+        """
 
         predicates = build_window_predicates(self._now)
+        selected = predicates.get(window_key) if window_key else None
+        if selected is not None:
+            rows = [
+                row
+                for row in rows
+                if (parsed := parse_timestamp(row.get("timestamp"))) is not None and selected.contains(parsed)
+            ]
+        window_keys = (window_key,) if selected is not None else WINDOW_ORDER
+
         windows: Dict[str, WindowMetrics] = {
-            key: WindowMetrics(key=key, label=WINDOW_LABELS[key]) for key in WINDOW_ORDER
+            key: WindowMetrics(key=key, label=WINDOW_LABELS[key]) for key in window_keys
         }
-        window_cache_hit = {key: 0 for key in WINDOW_ORDER}
-        window_cache_miss = {key: 0 for key in WINDOW_ORDER}
-        window_latency_sum = {key: 0.0 for key in WINDOW_ORDER}
-        window_latency_count = {key: 0 for key in WINDOW_ORDER}
+        window_cache_hit = {key: 0 for key in window_keys}
+        window_cache_miss = {key: 0 for key in window_keys}
+        window_latency_sum = {key: 0.0 for key in window_keys}
+        window_latency_count = {key: 0 for key in window_keys}
 
         total = WindowMetrics(key="total", label="总计")
         total_cache_hit = 0
@@ -285,6 +321,9 @@ class _SessionCollector:
         metrics.windows = windows
         metrics.total = total
         metrics.modules = sorted(module_values.values(), key=lambda item: (-item.tokens, item.name))
+        metrics.chat_tokens = int(
+            sum(item.tokens for item in metrics.modules if item.name in CHAT_GROUP_NAMES)
+        )
         all_model_rows = sorted(model_values.values(), key=lambda item: (-item.tokens, item.name))
         for model_row in all_model_rows:
             if model_row.requests > 0 and model_row.avg_response is not None:
@@ -304,7 +343,17 @@ class _SessionCollector:
         metrics.pies["model_cost"] = [
             PieSlice(name=item.name, value=item.cost) for item in all_model_rows if item.cost > 0
         ]
-        self._fill_bars(metrics, timestamps, token_values, cost_values, model_cost_values)
+        metrics.pies["model_requests"] = [
+            PieSlice(name=item.name, value=float(item.requests)) for item in all_model_rows if item.requests > 0
+        ]
+        self._fill_bars(
+            metrics,
+            timestamps,
+            token_values,
+            cost_values,
+            model_cost_values,
+            cutoff=selected.start if selected is not None else None,
+        )
 
     @staticmethod
     def _accumulate_window(
@@ -329,14 +378,21 @@ class _SessionCollector:
         token_values: List[float],
         cost_values: List[float],
         model_cost_values: Dict[str, List[float]],
+        cutoff: Optional[datetime] = None,
     ) -> None:
-        """用明细行生成会话维度的条形图数据。"""
+        """用明细行生成会话维度的条形图数据。
+
+        ``cutoff`` 为空时按配置的 ``chart.bar_days`` 计算起点；只统计单个时间窗口时
+        由调用方传入窗口起点，保证趋势图同样只覆盖该窗口。
+        """
 
         if not timestamps:
             return
         chart_config = self._config.chart
         granularity = chart_config.bar_granularity
-        cutoff = self._now - timedelta(days=max(int(chart_config.bar_days), 1))
+        metrics.chart_granularity = granularity
+        if cutoff is None:
+            cutoff = self._now - timedelta(days=max(int(chart_config.bar_days), 1))
 
         if chart_config.bar_tokens:
             merged = filter_and_merge_series(

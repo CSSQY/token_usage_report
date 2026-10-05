@@ -5,12 +5,14 @@
 """
 
 from datetime import datetime, timedelta
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 import logging
+import math
 
 from .config_model import TokenUsageReportConfig, build_model_alias_map, build_module_group_map
 from .metrics import (
+    CHAT_GROUP_NAMES,
     UNKNOWN_GROUP_NAME,
     WINDOW_LABELS,
     WINDOW_ORDER,
@@ -25,6 +27,7 @@ from .metrics import (
     filter_and_merge_series,
     limit_series_top,
     ordered_group_items,
+    parse_timestamp,
     resolve_module_group,
     sum_series_in_window,
 )
@@ -34,76 +37,187 @@ logger = logging.getLogger(__name__)
 _REPLY_TOOL_NAME = "reply"
 _MAX_HOST_LIMIT = 50
 
+_HOURLY_SPAN_LIMIT_HOURS = 168.0
+"""单窗口模式下仍用小时桶取数的窗口跨度上限（7 天）。
 
-async def collect_global_metrics(ctx: Any, config: TokenUsageReportConfig) -> ReportMetrics:
+超过该跨度改用天桶：数据量可控，且「今日 / 本周 / 本月」这类以零点为起点的窗口
+用天桶仍然精确，只有「最近 N×24 小时」这类滚动窗口的首个半天会不计入。
+"""
+
+_CALENDAR_WINDOW_KEYS = ("today", "this_week", "this_month")
+"""按本地日历零点起算的窗口；其余窗口按滚动时长回算。"""
+
+_WINDOW_DEFINITION_NOTE = (
+    "「今日 / 本周 / 本月」按本地日历零点起算（今日 = 今天 00:00 至今，不是最近 24 小时）；"
+    "「最近 24 / 7×24 / 30×24 小时」按滚动时长回算，两者不可直接比较"
+)
+
+_AGGREGATION_LAG_NOTE = "最近 15 分钟内的调用可能还没进表"
+
+_CHAT_SCOPE_NOTE = (
+    "总量包含全部模块：聊天链路（计划器 + 回复器）之外的记忆抽取、embedding、图片理解、"
+    "表情向量等后台流水线同样计入 Token，核对时请以「聊天链路 Token」为准"
+)
+
+
+def _window_definition(window_key: str) -> str:
+    """返回窗口的口径说明（日历零点起算 / 滚动时长）。"""
+
+    return "本地日历口径，零点起算" if window_key in _CALENDAR_WINDOW_KEYS else "滚动口径，按当前时间回算时长"
+
+
+async def collect_global_metrics(
+    ctx: Any,
+    config: TokenUsageReportConfig,
+    window_key: str = "",
+) -> ReportMetrics:
     """采集全局（全部会话）统计指标。
 
     Args:
         ctx: 插件运行时上下文。
         config: 插件配置。
+        window_key: 只统计单个时间窗口时传入窗口 key（``today`` / ``this_week`` 等）；
+            留空表示统计全部窗口。
 
     Returns:
         ReportMetrics: 全局指标快照；单项能力失败时对应区块标记为不可用。
     """
 
-    collector = _GlobalCollector(ctx=ctx, config=config)
+    collector = _GlobalCollector(ctx=ctx, config=config, window_key=window_key)
     return await collector.collect()
 
 
 class _GlobalCollector:
-    """全局指标采集器。"""
+    """全局指标采集器。
 
-    def __init__(self, ctx: Any, config: TokenUsageReportConfig) -> None:
+    未指定 ``window_key`` 时按「6 个时间窗口 + 最近 365 天总计」采集；
+    指定 ``window_key`` 时进入**单窗口模式**：只取覆盖该窗口所需的取数档位，
+    并把每条时间序列裁剪到窗口起点之后，因此窗口卡片、趋势图、模型排行、
+    占比分布全部只包含该窗口的数据，报告内部口径完全一致。
+    """
+
+    def __init__(self, ctx: Any, config: TokenUsageReportConfig, window_key: str = "") -> None:
         self._ctx = ctx
         self._config = config
         self._now = datetime.now()
         self._alias_map = build_model_alias_map(config.model_aliases.aliases)
         self._module_group_map = build_module_group_map(config.module_groups)
         self._predicates = build_window_predicates(self._now)
-        self._windows: Dict[str, WindowMetrics] = {
-            key: WindowMetrics(key=key, label=WINDOW_LABELS[key]) for key in WINDOW_ORDER
-        }
+        self._window_key = window_key if window_key in self._predicates else ""
+        self._window = self._predicates[self._window_key] if self._window_key else None
+        self._raw_module_tokens: Dict[str, float] = {}
+        self._resolve_tiers()
+        if self._window is None:
+            self._windows: Dict[str, WindowMetrics] = {
+                key: WindowMetrics(key=key, label=WINDOW_LABELS[key]) for key in WINDOW_ORDER
+            }
+            scope_name = build_scope_name("all")
+        else:
+            # 单窗口模式只保留所选窗口，避免把「被裁剪过的数据」误当成其他窗口的统计
+            label = WINDOW_LABELS[self._window_key]
+            self._windows = {self._window_key: WindowMetrics(key=self._window_key, label=label)}
+            scope_name = f"{build_scope_name('all')} · {label}"
         self._total_window = WindowMetrics(key="total", label="总计")
         self._metrics = ReportMetrics(
             scope="all",
-            scope_name=build_scope_name("all"),
+            scope_name=scope_name,
             generated_at=self._now,
             unit_name=config.token_unit.unit_name,
+            window_scoped=self._window is not None,
         )
+
+    def _resolve_tiers(self) -> None:
+        """解析取数档位（天数 / 桶粒度）与条形图颗粒度。
+
+        普通模式：窗口用「小时 + 32 天」，总计用「天 + 365 天」。
+        单窗口模式：两级共用一套档位，且只为覆盖窗口所需的跨度取数。
+        """
+
+        if self._window is None:
+            self._window_days, self._window_bucket = 32, "hour"
+            self._total_days, self._total_bucket = 365, "day"
+            self._chart_granularity = self._config.chart.bar_granularity
+            return
+
+        span_hours = max((self._now - self._window.start).total_seconds() / 3600.0, 1.0)
+        bucket = "hour" if span_hours <= _HOURLY_SPAN_LIMIT_HOURS else "day"
+        # 天数要覆盖整个窗口，并留出一点余量，保证裁剪前的序列已经包含窗口起点
+        days = int(math.ceil(span_hours / 24.0)) + (1 if bucket == "hour" else 2)
+        self._window_days = min(max(days, 1), 365)
+        self._window_bucket = bucket
+        self._total_days, self._total_bucket = self._window_days, bucket
+        self._chart_granularity = self._resolve_window_granularity(span_hours)
+
+    def _resolve_window_granularity(self, span_hours: float) -> str:
+        """单窗口模式下条形图的颗粒度：短窗口按小时，长窗口按天（尊重用户配置的周/月）。"""
+
+        configured = self._config.chart.bar_granularity
+        if configured in {"week", "month"}:
+            return configured
+        return "hour" if span_hours <= 48.0 else "day"
 
     async def collect(self) -> ReportMetrics:
         """执行完整的全局采集流程。"""
 
         statistics = self._ctx.statistics.local
-        chart_granularity = self._config.chart.bar_granularity
+        chart_granularity = self._chart_granularity
         chart_days, chart_bucket = self._resolve_chart_range(chart_granularity)
+        self._metrics.chart_granularity = chart_granularity
 
-        token_hourly = await self._fetch_series("Token 趋势（小时）", lambda: statistics.token_trend(days=32, bucket="hour"))
-        token_daily = await self._fetch_series("Token 趋势（天）", lambda: statistics.token_trend(days=365, bucket="day"))
-        cost_hourly = await self._fetch_series(
+        token_window = await self._fetch_series(
+            "Token 趋势（小时）",
+            lambda: statistics.token_trend(days=self._window_days, bucket=self._window_bucket),
+        )
+        cost_window = await self._fetch_series(
             "花费趋势（小时）",
-            lambda: statistics.model_trend(days=32, bucket="hour", metric="cost", top_models=_MAX_HOST_LIMIT),
+            lambda: statistics.model_trend(
+                days=self._window_days,
+                bucket=self._window_bucket,
+                metric="cost",
+                top_models=_MAX_HOST_LIMIT,
+            ),
         )
-        cost_daily = await self._fetch_series(
-            "花费趋势（天）",
-            lambda: statistics.model_trend(days=365, bucket="day", metric="cost", top_models=_MAX_HOST_LIMIT),
-        )
+        if self._window is None:
+            token_total = await self._fetch_series(
+                "Token 趋势（天）", lambda: statistics.token_trend(days=self._total_days, bucket=self._total_bucket)
+            )
+            cost_total = await self._fetch_series(
+                "花费趋势（天）",
+                lambda: statistics.model_trend(
+                    days=self._total_days,
+                    bucket=self._total_bucket,
+                    metric="cost",
+                    top_models=_MAX_HOST_LIMIT,
+                ),
+            )
+        else:
+            # 单窗口模式下窗口与总计是同一份数据（都已裁剪到窗口内），无需重复取数
+            token_total, cost_total = token_window, cost_window
 
-        self._fill_token_windows(token_hourly)
-        self._fill_cost_windows(cost_hourly)
-        self._fill_total(token_daily, cost_daily)
-        await self._fill_models()
+        self._fill_token_windows(token_window)
+        self._fill_cost_windows(cost_window)
+        self._fill_total(token_total, cost_total)
+        if self._window is None:
+            await self._fill_models()
+        else:
+            await self._fill_window_models(cost_series=cost_window)
         await self._fill_messages(chart_days, chart_bucket, chart_granularity)
         await self._fill_replies()
         await self._fill_online_time()
         module_names = await self._fill_module_distribution()
-        await self._fill_module_cost(chart_days, chart_bucket, chart_granularity, module_names)
+        await self._fill_module_series(
+            chart_days=chart_days,
+            chart_bucket=chart_bucket,
+            chart_granularity=chart_granularity,
+            module_names=module_names,
+        )
+        self._fill_chat_tokens()
         self._fill_bars(
             chart_granularity=chart_granularity,
-            token_hourly=token_hourly,
-            token_daily=token_daily,
-            cost_hourly=cost_hourly,
-            cost_daily=cost_daily,
+            token_hourly=token_window,
+            token_daily=token_total,
+            cost_hourly=cost_window,
+            cost_daily=cost_total,
         )
         self._fill_notes()
 
@@ -123,14 +237,53 @@ class _GlobalCollector:
             Tuple[int, str]: 天数与宿主桶粒度。
         """
 
+        if self._window is not None:
+            return self._window_days, self._window_bucket
         if granularity == "hour":
             return 32, "hour"
         return 365, "day"
 
     def _chart_cutoff(self) -> datetime:
-        """返回条形图横轴起点。"""
+        """返回条形图横轴起点（单窗口模式下即窗口起点）。"""
 
+        if self._window is not None:
+            return self._window.start
         return self._now - timedelta(days=max(int(self._config.chart.bar_days), 1))
+
+    def _clip_to_window(self, series: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """把序列裁剪到窗口起点之后（仅单窗口模式生效）。
+
+        宿主的统计能力只能按「最近 N 天」取数，无法直接指定起止时间，
+        因此这里在取数后按时间戳裁剪，保证窗口外的数据不会进入报告。
+
+        Args:
+            series: 能力返回的 series 结构。
+
+        Returns:
+            Optional[Dict[str, Any]]: 裁剪后的 series 结构。
+        """
+
+        if series is None or self._window is None:
+            return series
+        timestamps = [str(item) for item in series.get("timestamps", [])]
+        kept_indexes = [
+            index
+            for index, raw_timestamp in enumerate(timestamps)
+            if (parsed := parse_timestamp(raw_timestamp)) is not None and parsed >= self._window.start
+        ]
+        if len(kept_indexes) == len(timestamps):
+            return series
+        clipped_values: Dict[str, List[float]] = {}
+        for key, values in series.get("values_by_key", {}).items():
+            normalized = [float(item or 0) for item in values]
+            clipped_values[key] = [
+                normalized[index] if index < len(normalized) else 0.0 for index in kept_indexes
+            ]
+        return {
+            **series,
+            "timestamps": [timestamps[index] for index in kept_indexes],
+            "values_by_key": clipped_values,
+        }
 
     @staticmethod
     def _as_series(payload: Any) -> Dict[str, Any]:
@@ -159,6 +312,9 @@ class _GlobalCollector:
     async def _fetch_series(self, label: str, call: Callable[[], Awaitable[Any]]) -> Optional[Dict[str, Any]]:
         """调用能力并返回 series 结构；失败时记录不可用区块。
 
+        单窗口模式下返回值会被裁剪到窗口起点之后，因此调用方的窗口累加、
+        图表归并、模型聚合都会自动只覆盖所选窗口。
+
         Args:
             label: 区块名称，用于日志与「数据不可用」提示。
             call: 能力调用闭包。
@@ -168,7 +324,7 @@ class _GlobalCollector:
         """
 
         try:
-            return self._as_series(await call())
+            return self._clip_to_window(self._as_series(await call()))
         except Exception as exc:
             logger.error("[token_usage_report] %s 获取失败: %s", label, exc)
             self._metrics.unavailable.append(label)
@@ -282,65 +438,156 @@ class _GlobalCollector:
     # ──── 模型、消息、回复、在线时长 ────
 
     async def _fill_models(self) -> None:
-        """填充模型排行、模型占比与加权平均响应。"""
+        """填充模型排行、模型占比与加权平均响应（全时段口径）。
+
+        多个内部模型名映射到同一别名时会**合并成一行**：调用次数、Token、费用分别求和，
+        平均耗时按调用次数加权平均，别名冲突的内部名会记录一条 info 日志便于核对。
+        """
 
         statistics = self._ctx.statistics.local
         rows = await self._fetch_list("模型统计", lambda: statistics.models(days=365, limit=_MAX_HOST_LIMIT), "models")
-        self._metrics.models = []
         if rows is None:
+            self._metrics.models = []
             return
-
-        total_requests = 0
-        total_response_weight = 0.0
-        model_tokens: List[PieSlice] = []
-        model_cost: List[PieSlice] = []
+        aggregated: Dict[str, Dict[str, Any]] = {}
         for row in rows:
             if not isinstance(row, dict):
                 continue
-            internal_name = str(row.get("model_name") or "未知模型")
-            display_name = self._alias_map.get(internal_name, internal_name)
-            request_count = int(row.get("request_count") or 0)
-            tokens = int(row.get("total_tokens") or 0)
-            cost = float(row.get("total_cost") or 0.0)
-            avg_response = float(row.get("avg_response_time") or 0.0)
-            self._metrics.models.append(
+            self._accumulate_model(
+                aggregated,
+                internal_name=str(row.get("model_name") or "未知模型"),
+                requests=int(row.get("request_count") or 0),
+                tokens=int(row.get("total_tokens") or 0),
+                cost=float(row.get("total_cost") or 0.0),
+                latency_sum=float(row.get("avg_response_time") or 0.0) * int(row.get("request_count") or 0),
+            )
+        self._finalize_models(aggregated)
+
+    async def _fill_window_models(self, cost_series: Optional[Dict[str, Any]]) -> None:
+        """单窗口模式的模型排行：用按模型的序列在窗口内累加。
+
+        宿主``statistics.models`` 只能按「最近 N 天」取数，无法裁剪到窗口，
+        因此这里改用 ``model_trend`` 的 Token / 费用 / 次数 / 耗时四条序列，
+        它们都已裁剪到窗口起点之后，累加结果与窗口卡片口径一致。
+        """
+
+        statistics = self._ctx.statistics.local
+        days, bucket = self._total_days, self._total_bucket
+        token_series = await self._fetch_series(
+            "模型 Token 趋势",
+            lambda: statistics.model_trend(days=days, bucket=bucket, metric="token", top_models=_MAX_HOST_LIMIT),
+        )
+        request_series = await self._fetch_series(
+            "模型调用次数趋势",
+            lambda: statistics.model_trend(days=days, bucket=bucket, metric="request", top_models=_MAX_HOST_LIMIT),
+        )
+        latency_series = await self._fetch_series(
+            "模型耗时趋势",
+            lambda: statistics.model_trend(days=days, bucket=bucket, metric="latency", top_models=_MAX_HOST_LIMIT),
+        )
+        if token_series is None:
+            self._metrics.models = []
+            return
+
+        requests_by_model = _sum_series_by_label(request_series)
+        costs_by_model = _sum_series_by_label(cost_series)
+        latency_sum_by_model = _weighted_latency(latency_series, request_series)
+
+        aggregated: Dict[str, Dict[str, Any]] = {}
+        for internal_name, tokens in _sum_series_by_label(token_series).items():
+            requests = int(requests_by_model.get(internal_name, 0))
+            self._accumulate_model(
+                aggregated,
+                internal_name=internal_name,
+                requests=requests,
+                tokens=int(tokens),
+                cost=costs_by_model.get(internal_name, 0.0),
+                latency_sum=latency_sum_by_model.get(internal_name, 0.0),
+            )
+        self._finalize_models(aggregated)
+
+    def _accumulate_model(
+        self,
+        aggregated: Dict[str, Dict[str, Any]],
+        *,
+        internal_name: str,
+        requests: int,
+        tokens: int,
+        cost: float,
+        latency_sum: float,
+    ) -> None:
+        """把单个内部模型的用量累加到显示别名对应的桶中。"""
+
+        display_name = self._alias_map.get(internal_name, internal_name)
+        bucket = aggregated.setdefault(
+            display_name,
+            {"requests": 0, "tokens": 0, "cost": 0.0, "latency_sum": 0.0, "internal_names": []},
+        )
+        bucket["requests"] += requests
+        bucket["tokens"] += tokens
+        bucket["cost"] += cost
+        bucket["latency_sum"] += latency_sum
+        if internal_name not in bucket["internal_names"]:
+            bucket["internal_names"].append(internal_name)
+
+    def _finalize_models(self, aggregated: Dict[str, Dict[str, Any]]) -> None:
+        """把「显示别名 → 累加桶」整理成模型排行、占比与整体平均响应。"""
+
+        merged_models: List[ModelUsageRow] = []
+        total_requests = 0
+        total_latency_sum = 0.0
+        for display_name, bucket in aggregated.items():
+            internal_names = bucket["internal_names"]
+            if len(internal_names) > 1:
+                logger.info(
+                    "[token_usage_report] 以下模型已按别名合并为「%s」：%s",
+                    display_name,
+                    " / ".join(internal_names),
+                )
+            request_count = int(bucket["requests"])
+            merged_models.append(
                 ModelUsageRow(
                     name=display_name,
-                    internal_name=internal_name,
+                    internal_name="=".join(internal_names),
                     requests=request_count,
-                    tokens=tokens,
-                    cost=cost,
-                    avg_response=avg_response if request_count > 0 else None,
+                    tokens=int(bucket["tokens"]),
+                    cost=float(bucket["cost"]),
+                    avg_response=float(bucket["latency_sum"]) / request_count if request_count > 0 else None,
                 )
             )
             total_requests += request_count
-            total_response_weight += avg_response * request_count
-            if tokens > 0:
-                model_tokens.append(PieSlice(name=display_name, value=float(tokens)))
-            if cost > 0:
-                model_cost.append(PieSlice(name=display_name, value=cost))
+            total_latency_sum += float(bucket["latency_sum"])
 
-        self._metrics.models.sort(key=lambda item: (-item.tokens, item.name))
-        display_limit = max(1, min(self._config.limits.top_models, _MAX_HOST_LIMIT))
-        self._metrics.models = self._metrics.models[:display_limit]
-        self._metrics.pies["model_tokens"] = model_tokens
-        self._metrics.pies["model_cost"] = model_cost
+        merged_models.sort(key=lambda item: (-item.tokens, item.name))
+        self._metrics.models = merged_models[: max(1, min(self._config.limits.top_models, _MAX_HOST_LIMIT))]
+        # 占比图使用合并后的完整清单（不受排行显示条数限制），避免小模型被截断而占比之和不等于 100%
+        self._metrics.pies["model_tokens"] = [
+            PieSlice(name=item.name, value=float(item.tokens)) for item in merged_models if item.tokens > 0
+        ]
+        self._metrics.pies["model_cost"] = [
+            PieSlice(name=item.name, value=item.cost) for item in merged_models if item.cost > 0
+        ]
+        self._metrics.pies["model_requests"] = [
+            PieSlice(name=item.name, value=float(item.requests)) for item in merged_models if item.requests > 0
+        ]
         if total_requests > 0:
-            self._total_window.avg_response = total_response_weight / total_requests
+            self._total_window.avg_response = total_latency_sum / total_requests
 
     async def _fill_messages(self, chart_days: int, chart_bucket: str, chart_granularity: str) -> None:
         """填充消息数、聊天消息分布与聊天流消息序列。"""
 
         statistics = self._ctx.statistics.local
-        daily = await self._fetch_series(
+        distribution_series = await self._fetch_series(
             "消息趋势",
-            lambda: statistics.message_trend(days=365, bucket="day", top_chats=_MAX_HOST_LIMIT),
+            lambda: statistics.message_trend(
+                days=self._total_days, bucket=self._total_bucket, top_chats=_MAX_HOST_LIMIT
+            ),
         )
-        if daily is None:
+        if distribution_series is None:
             return
 
-        values_by_key = daily.get("values_by_key", {})
-        labels_by_key = daily.get("labels_by_key", {})
+        values_by_key = distribution_series.get("values_by_key", {})
+        labels_by_key = distribution_series.get("labels_by_key", {})
         self._metrics.messages = int(sum(_sum_key(values_by_key, key) for key in values_by_key))
 
         stream_types = await self._fetch_stream_types()
@@ -356,26 +603,39 @@ class _GlobalCollector:
             )
         chat_rows.sort(key=lambda item: (-item.messages, item.name))
         self._metrics.chats = chat_rows
-        self._metrics.pies["chat_messages"] = self._build_chat_pie_slices(chat_rows)
 
-        if chart_granularity == "hour":
+        if chart_bucket == self._total_bucket:
+            # 图表与分布同档位（含单窗口模式），直接复用同一份序列
+            chart_series = distribution_series
+        else:
             chart_series = await self._fetch_series(
                 "消息趋势（图表）",
                 lambda: statistics.message_trend(days=chart_days, bucket=chart_bucket, top_chats=_MAX_HOST_LIMIT),
             )
-        else:
-            chart_series = daily
         if chart_series is None:
             return
+        chart_labels_by_key = chart_series.get("labels_by_key", {})
         merged = filter_and_merge_series(
             [str(item) for item in chart_series.get("timestamps", [])],
-            _rename_series_values(chart_series.get("values_by_key", {}), chart_series.get("labels_by_key", {})),
+            _rename_series_values(chart_series.get("values_by_key", {}), chart_labels_by_key),
             granularity=chart_granularity,
             cutoff=self._chart_cutoff(),
         )
         merged.unit_label = "条"
         merged.value_formatter = "number"
-        self._metrics.bars["chat_messages"] = limit_series_top(merged, self._config.chart.series_top)
+        # 分布与趋势图可能是两次不同范围的取数，前 N 名名单不一定重合：
+        # 把两边的聊天对象名都纳入映射，避免漏改后在图片图例里泄露真名
+        name_map = self._chat_display_name_map(
+            chat_rows,
+            stream_types,
+            extra_names=[str(label) for label in chart_labels_by_key.values()],
+        )
+        self._metrics.pies["chat_messages"] = [
+            PieSlice(name=name_map.get(row.name, row.name), value=float(row.messages)) for row in chat_rows
+        ]
+        self._metrics.bars["chat_messages"] = limit_series_top(
+            _rename_series_names(merged, name_map), self._config.chart.series_top
+        )
 
     async def _fetch_stream_types(self) -> Dict[str, bool]:
         """获取「聊天对象名称 → 是否群聊」的映射，用于匿名化与展示。"""
@@ -398,26 +658,52 @@ class _GlobalCollector:
                     type_map.setdefault(name, is_group)
         return type_map
 
-    def _build_chat_pie_slices(self, chat_rows: List[ChatMessageRow]) -> List[PieSlice]:
-        """按配置生成聊天消息分布扇形图数据（可匿名化）。"""
+    def _chat_display_name_map(
+        self,
+        chat_rows: List[ChatMessageRow],
+        stream_types: Dict[str, bool],
+        extra_names: Sequence[str] = (),
+    ) -> Dict[str, str]:
+        """生成「聊天对象真名 → 展示名」映射（开启匿名化时改为 群聊A / 个人用户A 等）。
+
+        会话类型优先取自聊天流列表（宿主聚合表不含该字段），缺失时用分布里的判定结果；
+        仍然拿不到类型的按「会话X」处理。匿名化关闭时返回空映射，调用方按原名展示。
+
+        Args:
+            chat_rows: 按消息量降序排列的聊天对象明细。
+            stream_types: 「聊天对象名 → 是否群聊」映射。
+            extra_names: 额外需要覆盖的名字（例如只出现在趋势图取数范围内的聊天对象）。
+
+        Returns:
+            Dict[str, str]: 真名到展示名的映射；未开启匿名化时为空字典。
+        """
 
         if not self._config.render.anonymize:
-            return [PieSlice(name=row.name, value=float(row.messages)) for row in chat_rows]
+            return {}
 
-        slices: List[PieSlice] = []
+        type_by_name: Dict[str, bool] = dict(stream_types)
+        for row in chat_rows:
+            if row.is_group is not None:
+                type_by_name[row.name] = row.is_group
+
+        ordered_names = [row.name for row in chat_rows]
+        known_names = set(ordered_names)
+        ordered_names.extend(sorted(name for name in extra_names if name not in known_names))
+
+        name_map: Dict[str, str] = {}
         group_index = 0
         private_index = 0
-        for row in chat_rows:
-            if row.is_group is True:
-                display_name = f"群聊{_index_to_letter(group_index)}"
+        for name in ordered_names:
+            is_group = type_by_name.get(name)
+            if is_group is True:
+                name_map[name] = f"群聊{_index_to_letter(group_index)}"
                 group_index += 1
-            elif row.is_group is False:
-                display_name = f"个人用户{_index_to_letter(private_index)}"
+            elif is_group is False:
+                name_map[name] = f"个人用户{_index_to_letter(private_index)}"
                 private_index += 1
             else:
-                display_name = f"会话{_index_to_letter(len(slices))}"
-            slices.append(PieSlice(name=display_name, value=float(row.messages)))
-        return slices
+                name_map[name] = f"会话{_index_to_letter(len(name_map))}"
+        return name_map
 
     async def _fill_replies(self) -> None:
         """填充回复数（宿主内置统计口径：``reply`` 工具调用次数）。"""
@@ -425,7 +711,9 @@ class _GlobalCollector:
         statistics = self._ctx.statistics.local
         series = await self._fetch_series(
             "工具调用趋势",
-            lambda: statistics.tool_trend(days=365, bucket="day", top_tools=_MAX_HOST_LIMIT),
+            lambda: statistics.tool_trend(
+                days=self._total_days, bucket=self._total_bucket, top_tools=_MAX_HOST_LIMIT
+            ),
         )
         if series is None:
             return
@@ -443,19 +731,29 @@ class _GlobalCollector:
         """填充在线时长（小时）。"""
 
         statistics = self._ctx.statistics.local
-        series = await self._fetch_series("在线时长趋势", lambda: statistics.online_time_trend(days=365, bucket="day"))
+        series = await self._fetch_series(
+            "在线时长趋势",
+            lambda: statistics.online_time_trend(days=self._total_days, bucket=self._total_bucket),
+        )
         if series is None:
             return
         online_values = series.get("values_by_key", {}).get("online_hours", [])
         self._metrics.online_hours = float(sum(float(item or 0) for item in online_values))
 
     async def _fill_module_distribution(self) -> List[str]:
-        """填充模块 Token / 请求占比，并返回按 Token 降序的模块名清单。"""
+        """取得按 Token 降序的模块名清单与「原始模块名 → Token」明细。
+
+        单窗口模式下 ``token_distribution`` 只能按「最近 N 天」取数、无法裁剪到窗口，
+        因此这里只借用它的模块名清单，Token 明细改由带时间戳的按模块序列统计
+        （见 :meth:`_fill_module_series`）；模块占比饼图统一在那边生成。
+        """
 
         statistics = self._ctx.statistics.local
         distribution = await self._fetch_distribution(
             "模块分布",
-            lambda: statistics.token_distribution(days=365, group_by="module", top_items=_MAX_HOST_LIMIT),
+            lambda: statistics.token_distribution(
+                days=self._total_days, group_by="module", top_items=_MAX_HOST_LIMIT
+            ),
         )
         if distribution is None:
             return []
@@ -463,20 +761,19 @@ class _GlobalCollector:
         pies = distribution.get("pies", [])
         token_items = _extract_pie_items(pies, 0)
         request_map = {name: value for name, value in _extract_pie_items(pies, 1)}
+        self._raw_module_tokens = {module_name: token_value for module_name, token_value in token_items}
 
-        grouped_tokens: Dict[str, float] = {}
-        grouped_requests: Dict[str, float] = {}
-        for module_name, token_value in token_items:
-            group_name = resolve_module_group(module_name, self._module_group_map)
-            grouped_tokens[group_name] = grouped_tokens.get(group_name, 0.0) + token_value
-            grouped_requests[group_name] = grouped_requests.get(group_name, 0.0) + request_map.get(module_name, 0.0)
+        if self._window is None:
+            grouped_requests: Dict[str, float] = {}
+            for module_name, _token_value in token_items:
+                group_name = resolve_module_group(module_name, self._module_group_map)
+                grouped_requests[group_name] = grouped_requests.get(group_name, 0.0) + request_map.get(
+                    module_name, 0.0
+                )
 
-        self._metrics.pies["module_tokens"] = [
-            PieSlice(name=name, value=value) for name, value in ordered_group_items(grouped_tokens)
-        ]
-        self._metrics.pies["module_requests"] = [
-            PieSlice(name=name, value=value) for name, value in ordered_group_items(grouped_requests)
-        ]
+            self._metrics.pies["module_requests"] = [
+                PieSlice(name=name, value=value) for name, value in ordered_group_items(grouped_requests)
+            ]
 
         unmapped = sorted(
             module_name
@@ -488,17 +785,25 @@ class _GlobalCollector:
 
         return [module_name for module_name, _value in sorted(token_items, key=lambda item: -item[1])]
 
-    async def _fill_module_cost(
+    async def _fill_module_series(
         self,
+        *,
         chart_days: int,
         chart_bucket: str,
         chart_granularity: str,
         module_names: List[str],
     ) -> None:
-        """逐个模块获取花费序列，生成模块花费分布与趋势。
+        """逐个模块获取花费序列（单窗口模式下同时获取 Token 序列）。
 
-        宿主没有「按模块聚合花费」的能力，因此这里对 Token 排名前 N 的模块逐个调用
-        ``model_trend(metric=cost, module_name=M)``（N 由 ``limits.top_modules`` 控制）。
+        宿主没有「按模块聚合」的时间序列能力，因此这里对 Token 排名前 N 的模块逐个调用
+        ``model_trend(module_name=M)``（N 由 ``limits.top_modules`` 控制）。
+        单窗口模式额外取一份 Token 序列，让模块 Token 占比也收敛到窗口内。
+
+        Args:
+            chart_days: 条形图取数天数。
+            chart_bucket: 条形图取数桶粒度。
+            chart_granularity: 条形图颗粒度。
+            module_names: 按 Token 降序的模块名清单。
         """
 
         statistics = self._ctx.statistics.local
@@ -544,6 +849,26 @@ class _GlobalCollector:
                 accumulated[index] += value
             module_cost_totals[display_name] = module_cost_totals.get(display_name, 0.0) + sum(totals)
 
+        if self._window is not None:
+            # 单窗口模式：用带时间戳的「按模块 Token 序列」精确统计窗口内各模块，
+            # 一次调用覆盖全部模块（不受 limits.top_modules 限制），同时避免逐模块取数
+            series = await self._fetch_series(
+                "模块 Token 趋势",
+                lambda: statistics.token_trend(
+                    days=self._total_days,
+                    bucket=self._total_bucket,
+                    group_by="module",
+                    top_items=_MAX_HOST_LIMIT,
+                ),
+            )
+            if series is not None:
+                self._raw_module_tokens = _sum_series_by_label(series)
+
+        if self._raw_module_tokens:
+            grouped = _group_module_tokens(self._raw_module_tokens, self._module_group_map)
+            self._metrics.pies["module_tokens"] = [
+                PieSlice(name=name, value=value) for name, value in ordered_group_items(grouped)
+            ]
         if not labels or not module_series:
             return
         self._metrics.pies["module_cost"] = [
@@ -551,6 +876,19 @@ class _GlobalCollector:
         ]
         bars = SeriesData(labels=labels, series=module_series, unit_label="¥", value_formatter="cost")
         self._metrics.bars["module_cost"] = limit_series_top(bars, self._config.chart.series_top)
+
+    def _fill_chat_tokens(self) -> None:
+        """填充聊天链路（计划器 + 回复器）的 Token 合计。
+
+        报告的总量包含记忆抽取、embedding、视觉理解等后台流水线，它们不随聊天量变化，
+        单独标出聊天链路才能和「我到底聊了多少」的直觉对上。
+        """
+
+        grouped = _group_module_tokens(self._raw_module_tokens, self._module_group_map)
+        if not grouped:
+            return
+        chat_total = sum(value for name, value in grouped.items() if name in CHAT_GROUP_NAMES)
+        self._metrics.chat_tokens = int(chat_total)
 
     # ──── 条形图 ────
 
@@ -621,19 +959,152 @@ class _GlobalCollector:
     def _fill_notes(self) -> None:
         """填充报告脚注（统计口径说明）。"""
 
-        self._metrics.total_scope_note = "最近 365 天"
-        self._metrics.notes = [
-            "总计口径：最近 365 天（宿主统计能力上限）",
+        top_modules = max(1, min(self._config.limits.top_modules, _MAX_HOST_LIMIT))
+        if self._window is None:
+            self._metrics.total_scope_note = "最近 365 天"
+            self._metrics.notes = [
+                "总计口径：最近 365 天（宿主统计能力上限）",
+                f"窗口口径：{_WINDOW_DEFINITION_NOTE}",
+                _CHAT_SCOPE_NOTE,
+                "消息数 / 回复数只覆盖消息量前 50 会话与调用量前 50 工具",
+                f"模块花费只统计 Token 前 {top_modules} 个模块，其余归入「其他」",
+                f"数据来自宿主的按小时聚合表，宿主每 15 分钟刷新一次：{_AGGREGATION_LAG_NOTE}",
+            ]
+            return
+
+        label = WINDOW_LABELS[self._window_key]
+        self._metrics.total_scope_note = label
+        notes = [
+            f"本次报告只统计「{label}」（{_window_definition(self._window_key)}）："
+            "时间窗口、趋势图、模型排行与占比分布均为该窗口数据",
+            _CHAT_SCOPE_NOTE,
             "消息数 / 回复数只覆盖消息量前 50 会话与调用量前 50 工具",
-            f"模块花费只统计 Token 前 {max(1, min(self._config.limits.top_modules, _MAX_HOST_LIMIT))} 个模块，其余归入「其他」",
-            "宿主统计为小时级聚合，最新数据最长滞后约 15 分钟",
+            f"模块花费只统计 Token 前 {top_modules} 个模块，其余归入「其他」",
+            f"数据来自宿主的按小时聚合表，宿主每 15 分钟刷新一次：{_AGGREGATION_LAG_NOTE}",
         ]
+        if self._window_bucket == "day":
+            notes.append("该窗口跨度较长，按天聚合，最早不足一天的部分不计入")
+        self._metrics.notes = notes
+
+
+def _rename_series_names(series_data: SeriesData, name_map: Dict[str, str]) -> SeriesData:
+    """按「真名 → 展示名」重命名多序列图里的序列名。
+
+    用于聊天对象匿名化：趋势图图例与扇形图必须用同一套展示名，否则真名会从
+    图例里泄露出去。多个真名映射到同一展示名时按位置累加。
+
+    Args:
+        series_data: 原始多序列数据。
+        name_map: 真名到展示名的映射；为空时原样返回。
+
+    Returns:
+        SeriesData: 重命名后的多序列数据。
+    """
+
+    if not name_map:
+        return series_data
+    renamed: Dict[str, List[float]] = {}
+    for name, values in series_data.series.items():
+        display_name = name_map.get(name, name)
+        accumulated = renamed.get(display_name)
+        if accumulated is None:
+            renamed[display_name] = list(values)
+            continue
+        for index, value in enumerate(values):
+            if index < len(accumulated):
+                accumulated[index] += float(value or 0)
+    return SeriesData(
+        labels=list(series_data.labels),
+        series=renamed,
+        unit_label=series_data.unit_label,
+        value_formatter=series_data.value_formatter,
+    )
 
 
 def _sum_key(values_by_key: Dict[str, List[float]], key: str) -> float:
     """累加某个序列键的全部数值。"""
 
     return float(sum(float(item or 0) for item in values_by_key.get(key, [])))
+
+
+def _group_module_tokens(
+    raw_module_tokens: Dict[str, float],
+    group_map: Dict[str, str],
+) -> Dict[str, float]:
+    """把「原始模块名 → Token」按配置的模块分组汇总。"""
+
+    grouped: Dict[str, float] = {}
+    for module_name, tokens in raw_module_tokens.items():
+        group_name = resolve_module_group(module_name, group_map)
+        grouped[group_name] = grouped.get(group_name, 0.0) + float(tokens or 0)
+    return grouped
+
+
+def _sum_series_by_label(series: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    """把 series 结构按序列标签累加成「标签 → 合计值」。
+
+    宿主给每个序列名做了安全化处理，这里用 ``labels_by_key`` 还原成可读名称。
+
+    Args:
+        series: 能力返回的 series 结构；为空时返回空字典。
+
+    Returns:
+        Dict[str, float]: 标签到合计值的映射。
+    """
+
+    if series is None:
+        return {}
+    labels_by_key = series.get("labels_by_key", {})
+    totals: Dict[str, float] = {}
+    for key, values in series.get("values_by_key", {}).items():
+        label = str(labels_by_key.get(key, key))
+        totals[label] = totals.get(label, 0.0) + sum(float(item or 0) for item in values)
+    return totals
+
+
+def _weighted_latency(
+    latency_series: Optional[Dict[str, Any]],
+    request_series: Optional[Dict[str, Any]],
+) -> Dict[str, float]:
+    """把「每桶平均耗时」按桶内调用次数加权，得到各模型的耗时总和。
+
+    宿主 ``model_trend(metric="latency")`` 每个桶返回的是该桶的平均耗时，
+    直接相加没有意义，必须乘以同一桶的调用次数才能还原整体平均。
+
+    Args:
+        latency_series: 耗时序列。
+        request_series: 同一档位的调用次数序列，用于取权重。
+
+    Returns:
+        Dict[str, float]: 标签到「平均耗时 × 调用次数」合计的映射。
+    """
+
+    if latency_series is None:
+        return {}
+    request_by_label = _series_values_by_label(request_series)
+    latency_labels = latency_series.get("labels_by_key", {})
+    totals: Dict[str, float] = {}
+    for key, values in latency_series.get("values_by_key", {}).items():
+        label = str(latency_labels.get(key, key))
+        requests = request_by_label.get(label, [])
+        weighted = 0.0
+        for index, value in enumerate(values):
+            count = float(requests[index]) if index < len(requests) else 0.0
+            weighted += float(value or 0) * count
+        totals[label] = totals.get(label, 0.0) + weighted
+    return totals
+
+
+def _series_values_by_label(series: Optional[Dict[str, Any]]) -> Dict[str, List[float]]:
+    """把 series 结构转成「标签 → 数值列表」，便于按标签对齐两条序列。"""
+
+    if series is None:
+        return {}
+    labels_by_key = series.get("labels_by_key", {})
+    return {
+        str(labels_by_key.get(key, key)): [float(item or 0) for item in values]
+        for key, values in series.get("values_by_key", {}).items()
+    }
 
 
 def _sum_all_values(values_by_key: Dict[str, List[float]]) -> float:

@@ -3,6 +3,7 @@
 from typing import Any, Dict, List, Optional
 
 import logging
+import re
 
 from .config_model import TokenUsageReportConfig
 from .metrics import (
@@ -16,12 +17,34 @@ from .metrics import (
     format_per_hour,
     format_response_zh,
     format_tokens_per_hour,
+    model_token_total,
 )
 
 logger = logging.getLogger(__name__)
 
 _UNAVAILABLE_TEXT = "数据不可用"
-_HOST_NOT_PROVIDED = "宿主不提供（仅会话维度可用）"
+
+_WINDOW_SCOPE_MARK = "本次报告只统计"
+
+_TOTAL_KEYS = (
+    "total_scope",
+    "total_tokens",
+    "total_raw",
+    "total_prompt",
+    "total_completion",
+    "total_requests",
+    "total_cost",
+    "total_avg_response",
+)
+
+_REDUNDANT_TOTAL_KEYS = ("total_scope", "total_tokens", "total_raw")
+"""只统计单个时间窗口时，与窗口卡片数字重复的「总计」占位符：整行隐藏。"""
+
+_CACHE_KEYS = ("cache_hit_rate", "cache_hit_tokens", "cache_miss_tokens")
+"""缓存指标占位符：宿主聚合表没有缓存字段，只有会话维度（调用明细）能拿到。
+
+无数据时整行隐藏，而不是渲染成「宿主不提供」，避免报告里出现无意义的占位文字。
+"""
 
 
 def build_placeholders(metrics: ReportMetrics, config: TokenUsageReportConfig) -> Dict[str, str]:
@@ -41,7 +64,6 @@ def build_placeholders(metrics: ReportMetrics, config: TokenUsageReportConfig) -
         "unit_name": unit_name,
         "scope": metrics.scope,
         "scope_name": metrics.scope_name,
-        "total_scope": metrics.total_scope_note or "最近 365 天",
     }
 
     for key in WINDOW_ORDER:
@@ -52,11 +74,13 @@ def build_placeholders(metrics: ReportMetrics, config: TokenUsageReportConfig) -
         placeholders[f"{key}_raw"] = str(window.tokens)
         placeholders[f"{key}_requests"] = format_number_zh(window.requests)
         placeholders[f"{key}_cost"] = format_cost_zh(window.cost)
-
     total = metrics.total
+    total_cost = total.cost if total is not None else None
+
     if total is not None:
         placeholders.update(
             {
+                "total_scope": metrics.total_scope_note or "最近 365 天",
                 "total_tokens": f"{format_number_zh(total.tokens)} {unit_name}",
                 "total_raw": str(total.tokens),
                 "total_prompt": format_number_zh(total.prompt_tokens),
@@ -67,23 +91,16 @@ def build_placeholders(metrics: ReportMetrics, config: TokenUsageReportConfig) -
             }
         )
     else:
-        placeholders.update(
-            {
-                "total_tokens": _UNAVAILABLE_TEXT,
-                "total_raw": "0",
-                "total_prompt": _UNAVAILABLE_TEXT,
-                "total_completion": _UNAVAILABLE_TEXT,
-                "total_requests": _UNAVAILABLE_TEXT,
-                "total_cost": _UNAVAILABLE_TEXT,
-                "total_avg_response": _UNAVAILABLE_TEXT,
-            }
-        )
+        placeholders.update({key: "" for key in _TOTAL_KEYS})
 
-    total_cost = total.cost if total is not None else None
     placeholders.update(
         {
-            "messages": format_number_zh(metrics.messages) if metrics.messages is not None else _UNAVAILABLE_TEXT,
-            "replies": format_number_zh(metrics.replies) if metrics.replies is not None else _UNAVAILABLE_TEXT,
+            "messages": (
+                format_number_zh(metrics.messages) if metrics.messages is not None else _UNAVAILABLE_TEXT
+            ),
+            "replies": (
+                format_number_zh(metrics.replies) if metrics.replies is not None else _UNAVAILABLE_TEXT
+            ),
             "received_messages": (
                 format_number_zh(metrics.received_messages)
                 if metrics.received_messages is not None
@@ -109,18 +126,17 @@ def build_placeholders(metrics: ReportMetrics, config: TokenUsageReportConfig) -
     cache_rate = total.cache_hit_rate if total is not None else None
     placeholders.update(
         {
-            "cache_hit_rate": (
-                f"{cache_rate * 100:.2f}%" if cache_rate is not None else _HOST_NOT_PROVIDED
-            ),
+            # 缓存指标只有会话维度有数据，全局视图置空后由整行裁剪逻辑丢掉
+            "cache_hit_rate": f"{cache_rate * 100:.2f}%" if cache_rate is not None else "",
             "cache_hit_tokens": (
                 format_number_zh(total.cache_hit_tokens)
                 if total is not None and total.cache_hit_tokens is not None
-                else _HOST_NOT_PROVIDED
+                else ""
             ),
             "cache_miss_tokens": (
                 format_number_zh(total.cache_miss_tokens)
                 if total is not None and total.cache_miss_tokens is not None
-                else _HOST_NOT_PROVIDED
+                else ""
             ),
             "model_ranking": build_model_ranking_text(metrics),
             "module_breakdown": build_module_breakdown_text(metrics, config),
@@ -137,6 +153,34 @@ def build_placeholders(metrics: ReportMetrics, config: TokenUsageReportConfig) -
     return placeholders
 
 
+def collect_suppressed_keys(metrics: ReportMetrics) -> set[str]:
+    """返回当前口径下被有意置空的占位符名。
+
+    渲染模板时据此**按行裁剪**：某一行引用到的占位符全部被抑制时，该行（含静态文字）
+    整行丢弃，避免留下「本周：（ 次请求 / ）」这种空壳行。
+
+    Args:
+        metrics: 指标快照。
+
+    Returns:
+        set[str]: 被抑制的占位符名集合。
+    """
+
+    suppressed: set[str] = set()
+    if metrics.total is None:
+        suppressed.update(_TOTAL_KEYS)
+    elif metrics.window_scoped:
+        # 单窗口模式下「总计」就等于窗口卡片，重复的一行直接丢掉
+        suppressed.update(_REDUNDANT_TOTAL_KEYS)
+    if metrics.total is None or metrics.total.cache_hit_rate is None:
+        # 全局视图（宿主聚合表）没有缓存数据，相关行整行隐藏
+        suppressed.update(_CACHE_KEYS)
+    for key in WINDOW_ORDER:
+        if key not in metrics.windows:
+            suppressed.update({key, f"{key}_raw", f"{key}_requests", f"{key}_cost"})
+    return suppressed
+
+
 def build_model_ranking_text(metrics: ReportMetrics) -> str:
     """构造模型排行文本区块。"""
 
@@ -147,7 +191,7 @@ def build_model_ranking_text(metrics: ReportMetrics) -> str:
         avg_text = format_response_zh(row.avg_response) if row.avg_response is not None else "N/A"
         lines.append(
             f"{index}. {row.name}｜{format_number_zh(row.tokens)} {metrics.unit_name}"
-            f"｜{format_number_zh(row.requests)} 次｜{format_cost_zh(row.cost)}｜平均 {avg_text}"
+            f"｜{format_number_zh(row.requests)}次｜{format_cost_zh(row.cost)}｜平均 {avg_text}"
         )
     return "\n".join(lines)
 
@@ -179,7 +223,7 @@ def build_chat_share_text(metrics: ReportMetrics) -> str:
         return ""
     total_value = sum(item.value for item in slices) or 1.0
     items = " · ".join(
-        f"{item.name} {item.value / total_value * 100:.1f}%（{format_number_zh(item.value)} 条）"
+        f"{item.name} {item.value / total_value * 100:.1f}%（{format_number_zh(item.value)}条）"
         for item in slices[:10]
     )
     return f"聊天消息分布（前 10）：{items}"
@@ -194,7 +238,7 @@ def build_details_text(metrics: ReportMetrics, config: TokenUsageReportConfig) -
         "详细数据（模型明细）：",
         "名称｜调用次数｜Token｜费用｜平均耗时｜Token 占比",
     ]
-    token_total = sum(row.tokens for row in metrics.models) or 1
+    token_total = model_token_total(metrics)
     for row in metrics.models:
         avg_text = format_response_zh(row.avg_response) if row.avg_response is not None else "N/A"
         lines.append(
@@ -275,6 +319,33 @@ def _tidy_text(text: str) -> str:
     return "\n".join(tidied).strip()
 
 
+def _drop_fully_suppressed_lines(template: str, suppressed: set[str]) -> str:
+    """丢弃「引用到的占位符全部被抑制」的模板行。
+
+    这样在只统计某个时间窗口时，形如
+    ``本周：{this_week}（{this_week_requests}次请求 / {this_week_cost}）``
+    的行会整行消失，而不是渲染成 ``本周：（次请求 / ）``。
+
+    Args:
+        template: 原始模板文本。
+        suppressed: 被抑制的占位符名集合。
+
+    Returns:
+        str: 裁剪后的模板文本。
+    """
+
+    if not suppressed:
+        return template
+
+    kept_lines: List[str] = []
+    for line in template.splitlines():
+        referenced = set(re.findall(r"\{(\w+)\}", line))
+        if referenced and referenced <= suppressed:
+            continue
+        kept_lines.append(line)
+    return "\n".join(kept_lines)
+
+
 def render_text_report(metrics: ReportMetrics, config: TokenUsageReportConfig) -> str:
     """按模板渲染文本报告。
 
@@ -287,13 +358,42 @@ def render_text_report(metrics: ReportMetrics, config: TokenUsageReportConfig) -
     """
 
     placeholders = build_placeholders(metrics, config)
-    template = config.report.template
+    suppressed = collect_suppressed_keys(metrics)
+    template = _drop_fully_suppressed_lines(config.report.template, suppressed)
     try:
-        return _tidy_text(template.format_map(_SafeFormatDict(placeholders)))
+        rendered = _tidy_text(template.format_map(_SafeFormatDict(placeholders)))
     except Exception as exc:
         logger.error("[token_usage_report] 文本模板渲染失败，已回退默认模板: %s", exc)
         default_template = type(config.report).model_fields["template"].default
-        return _tidy_text(str(default_template).format_map(_SafeFormatDict(placeholders)))
+        fallback_template = _drop_fully_suppressed_lines(str(default_template), suppressed)
+        rendered = _tidy_text(fallback_template.format_map(_SafeFormatDict(placeholders)))
+    return _append_window_scope_notice(rendered, metrics)
+
+
+def _append_window_scope_notice(text: str, metrics: ReportMetrics) -> str:
+    """单窗口口径下追加一句范围说明。
+
+    默认模板没有 ``{notes}`` 行，因此这里直接追加，让用户知道整份报告
+    （含趋势图、模型排行、占比分布）都只覆盖所选窗口。
+
+    Args:
+        text: 已渲染的文本。
+        metrics: 指标快照。
+
+    Returns:
+        str: 追加说明后的文本。
+    """
+
+    if not metrics.window_scoped:
+        return text
+    if _WINDOW_SCOPE_MARK in text:
+        return text
+    window = next(iter(metrics.windows.values()), None)
+    label = window.label if window is not None else "所选时间"
+    return (
+        f"{text}\n（{_WINDOW_SCOPE_MARK}「{label}」：时间窗口、趋势图、模型排行与占比分布"
+        "均为该窗口数据；去掉指令里的时间参数可查看全部窗口与全时段数据）"
+    )
 
 
 async def read_persona_prompt(ctx: Any, config: TokenUsageReportConfig) -> str:
