@@ -186,7 +186,7 @@ def build_model_ranking_text(metrics: ReportMetrics) -> str:
 
     if not metrics.models:
         return ""
-    lines = ["模型排行（按 Token 排序）："]
+    lines = [f"模型排行（按 {metrics.unit_name} 排序）："]
     for index, row in enumerate(metrics.models, start=1):
         avg_text = format_response_zh(row.avg_response) if row.avg_response is not None else "N/A"
         lines.append(
@@ -212,7 +212,7 @@ def build_module_breakdown_text(metrics: ReportMetrics, config: TokenUsageReport
             f"{item.name} {item.value / cost_total * 100:.1f}%" for item in cost_slices
         )
         cost_text = f"\n模块花费占比：{cost_items}"
-    return f"模块 Token 占比：{items}{cost_text}"
+    return f"模块 {metrics.unit_name} 占比：{items}{cost_text}"
 
 
 def build_chat_share_text(metrics: ReportMetrics) -> str:
@@ -236,7 +236,7 @@ def build_details_text(metrics: ReportMetrics, config: TokenUsageReportConfig) -
         return ""
     lines = [
         "详细数据（模型明细）：",
-        "名称｜调用次数｜Token｜费用｜平均耗时｜Token 占比",
+        f"名称｜调用次数｜{metrics.unit_name}｜费用｜平均耗时｜{metrics.unit_name} 占比",
     ]
     token_total = model_token_total(metrics)
     for row in metrics.models:
@@ -255,7 +255,7 @@ def build_data_block(metrics: ReportMetrics, config: TokenUsageReportConfig) -> 
     lines: List[str] = [
         f"统计范围：{placeholders['scope_name']}",
         f"生成时间：{placeholders['date']}",
-        f"Token 单位名称：{metrics.unit_name}",
+        f"用量单位名称：{metrics.unit_name}",
     ]
     for key in WINDOW_ORDER:
         window = metrics.windows.get(key)
@@ -280,8 +280,8 @@ def build_data_block(metrics: ReportMetrics, config: TokenUsageReportConfig) -> 
         f"接收消息数：{placeholders['received_messages']}，在线时长：{placeholders['online_duration']}"
     )
     lines.append(
-        f"缓存命中率：{placeholders['cache_hit_rate']}，缓存命中 Token：{placeholders['cache_hit_tokens']}，"
-        f"缓存未命中 Token：{placeholders['cache_miss_tokens']}"
+        f"缓存命中率：{placeholders['cache_hit_rate']}，缓存命中 {metrics.unit_name}：{placeholders['cache_hit_tokens']}，"
+        f"缓存未命中 {metrics.unit_name}：{placeholders['cache_miss_tokens']}"
     )
     for block_key in ("model_ranking", "module_breakdown", "chat_message_share"):
         block_text = placeholders.get(block_key, "")
@@ -461,6 +461,30 @@ def _build_persona_text(persona_values: Dict[str, str]) -> str:
     return "。".join(lines) + "。" if lines else ""
 
 
+def _render_llm_prompt(raw_prompt: str, unit_name: str) -> str:
+    """渲染转述提示词里的 ``{unit_name}`` 占位符。
+
+    只替换单位名，其余花括号（例如用户自己写的 JSON 示例）一律原样保留：
+    模板语法错误时回退为原始文本并记一条警告，不影响本次转述。
+
+    Args:
+        raw_prompt: 配置中的转述提示词。
+        unit_name: 当前配置的用量单位名。
+
+    Returns:
+        str: 替换后的提示词。
+    """
+
+    prompt = str(raw_prompt or "")
+    if "{unit_name}" not in prompt:
+        return prompt
+    try:
+        return prompt.format_map(_SafeFormatDict({"unit_name": unit_name}))
+    except Exception as exc:
+        logger.warning("[token_usage_report] 转述提示词的 {unit_name} 替换失败，已按原文使用：%s", exc)
+        return prompt
+
+
 async def render_llm_report(
     ctx: Any,
     metrics: ReportMetrics,
@@ -469,6 +493,7 @@ async def render_llm_report(
     """调用宿主模型组对统计结果做风格化转述；失败时回退为模板文本。
 
     提示词结构：``宿主人格`` + ``report.llm_prompt`` + ``统计数据``。
+    转述提示词里可以用 ``{unit_name}`` 引用当前配置的用量单位名。
 
     Args:
         ctx: 插件运行时上下文。
@@ -480,7 +505,8 @@ async def render_llm_report(
     """
 
     persona_prefix = await read_persona_prompt(ctx, config)
-    prompt = f"{persona_prefix}{config.report.llm_prompt}\n\n{build_data_block(metrics, config)}"
+    llm_prompt = _render_llm_prompt(config.report.llm_prompt, metrics.unit_name)
+    prompt = f"{persona_prefix}{llm_prompt}\n\n{build_data_block(metrics, config)}"
     try:
         result = await ctx.llm.generate(prompt=prompt, task_name=config.report.llm_task_name)
     except Exception as exc:

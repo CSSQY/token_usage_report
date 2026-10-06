@@ -348,15 +348,16 @@ def _render_kpi_block(metrics: ReportMetrics) -> str:
 
     total = metrics.total
     total_cost = total.cost if total is not None else None
+    unit_name = metrics.unit_name
     kpis: List[Tuple[str, str]] = []
     if total is not None:
         scope_note = metrics.total_scope_note or "最近 365 天"
         total_title = f"{scope_note}合计" if metrics.window_scoped else f"总计（{scope_note}）"
         kpis.extend(
             [
-                (total_title, f"{format_number_zh(total.tokens)} {metrics.unit_name}"),
-                ("输入 Token", format_number_zh(total.prompt_tokens)),
-                ("输出 Token", format_number_zh(total.completion_tokens)),
+                (total_title, f"{format_number_zh(total.tokens)} {unit_name}"),
+                (f"输入 {unit_name}", format_number_zh(total.prompt_tokens)),
+                (f"输出 {unit_name}", format_number_zh(total.completion_tokens)),
                 ("总请求数", format_number_zh(total.requests)),
                 ("总花费", format_cost_zh(total.cost)),
                 ("平均响应", format_response_zh(total.avg_response)),
@@ -379,8 +380,8 @@ def _render_kpi_block(metrics: ReportMetrics) -> str:
             ("花费/回复数量", format_per_100(total_cost, metrics.replies)),
             ("花费/时间", format_per_hour(total_cost, metrics.online_hours)),
             (
-                "Token/时间",
-                format_tokens_per_hour(total.tokens if total else None, metrics.online_hours, metrics.unit_name),
+                f"{unit_name}/时间",
+                format_tokens_per_hour(total.tokens if total else None, metrics.online_hours, unit_name),
             ),
         ]
     )
@@ -389,14 +390,14 @@ def _render_kpi_block(metrics: ReportMetrics) -> str:
         kpis.extend(
             [
                 ("Prompt 缓存命中率", f"{total.cache_hit_rate * 100:.2f}%"),
-                ("缓存命中 Token", format_number_zh(total.cache_hit_tokens)),
-                ("缓存未命中 Token", format_number_zh(total.cache_miss_tokens)),
+                (f"缓存命中 {unit_name}", format_number_zh(total.cache_hit_tokens)),
+                (f"缓存未命中 {unit_name}", format_number_zh(total.cache_miss_tokens)),
             ]
         )
     if metrics.chat_tokens is not None and total is not None and total.tokens > 0:
         # 报告总量含记忆/图片等后台流水线，单独标出聊天链路，便于与直觉核对
         chat_share = metrics.chat_tokens / total.tokens * 100
-        kpis.append((f"聊天链路 Token（占 {chat_share:.1f}%）", format_number_zh(metrics.chat_tokens)))
+        kpis.append((f"聊天链路 {unit_name}（占 {chat_share:.1f}%）", format_number_zh(metrics.chat_tokens)))
     items = "".join(
         f"<div class=\"kpi\"><div class=\"kpi-title\">{_escape(title)}</div>"
         f"<div class=\"kpi-value\">{_escape(value)}</div></div>"
@@ -414,7 +415,7 @@ def _render_bar_section(
 
     chart_config = config.chart
     chart_specs: Sequence[Tuple[str, bool, str]] = (
-        ("tokens", chart_config.bar_tokens, "Token 趋势"),
+        ("tokens", chart_config.bar_tokens, f"{metrics.unit_name} 趋势"),
         ("cost", chart_config.bar_cost, "总花费趋势"),
         ("model_cost", chart_config.bar_model_cost, "各模型花费趋势"),
         ("module_cost", chart_config.bar_module_cost, "各模块花费趋势"),
@@ -455,9 +456,9 @@ def _render_pie_section(
 
     chart_config = config.chart
     pie_specs: Sequence[Tuple[str, bool, str, str]] = (
-        ("module_tokens", chart_config.pie_module_tokens, "模块 Token 占比", "number"),
+        ("module_tokens", chart_config.pie_module_tokens, f"模块 {metrics.unit_name} 占比", "number"),
         ("module_cost", chart_config.pie_module_cost, "模块花费分布", "cost"),
-        ("model_tokens", chart_config.pie_model_tokens, "模型 Token 占比", "number"),
+        ("model_tokens", chart_config.pie_model_tokens, f"模型 {metrics.unit_name} 占比", "number"),
         ("model_cost", chart_config.pie_model_cost, "模型花费分布", "cost"),
         ("model_requests", chart_config.pie_model_requests, "模型调用量分布", "number"),
         ("chat_messages", chart_config.pie_chat_messages, "聊天消息分布", "number"),
@@ -498,7 +499,8 @@ def _render_model_table(metrics: ReportMetrics, config: TokenUsageReportConfig) 
         )
     return (
         "<h2>模型用量排行</h2>\n<table><thead><tr>"
-        "<th>#</th><th>模型</th><th>Token</th><th>调用次数</th><th>费用</th><th>平均耗时</th><th>占比</th>"
+        f"<th>#</th><th>模型</th><th>{_escape(metrics.unit_name)}</th>"
+        "<th>调用次数</th><th>费用</th><th>平均耗时</th><th>占比</th>"
         f"</tr></thead><tbody>{''.join(rows)}</tbody></table>"
     )
 

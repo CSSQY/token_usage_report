@@ -10,9 +10,17 @@
 （``tags`` 在该页面没有对应控件，会退化成普通输入框）。
 """
 
-from typing import Dict, List, Literal
+from typing import Any, Dict, List, Literal
 
 from maibot_sdk import Field, PluginConfigBase
+from pydantic import field_validator
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_UNIT_NAME = "Token"
+"""用量单位名的默认值；配置里留空时回退到它。"""
 
 _DEFAULT_TEMPLATE = """📊 {unit_name} 消耗统计（{date}）
 统计范围：{scope_name}
@@ -31,8 +39,9 @@ _DEFAULT_TEMPLATE = """📊 {unit_name} 消耗统计（{date}）
 {chat_message_share}"""
 
 _DEFAULT_LLM_PROMPT = (
-    "请用自然、口语化的中文，把下面这份 Token 消耗数据转述给群友或用户。要求：保留全部数字，"
+    "请用自然、口语化的中文，把下面这份用量统计数据转述给群友或用户。要求：保留全部数字，"
     "不要编造、不要省略任何一项，不要输出表格或代码块，控制在 10 行以内。"
+    "数据里给出了用量单位名称，转述时请照用该单位名。"
 )
 
 
@@ -66,28 +75,44 @@ class PluginSection(PluginConfigBase):
         json_schema_extra={"label": "启用插件", "hint": "关闭后 /token、LLM 工具与定时播报全部停止"},
     )
     config_version: str = Field(
-        default="1.8.2",
+        default="1.8.4",
         description="配置结构版本，由插件维护；升级配置结构时递增，用户一般不需要改动",
-        json_schema_extra={"label": "配置版本", "hint": "插件用它判断是否升级配置结构，一般不用改", "placeholder": "1.8.2"},
+        json_schema_extra={"label": "配置版本", "hint": "插件用它判断是否升级配置结构，一般不用改", "placeholder": "1.8.4"},
     )
 
 
 class TokenUnitSection(PluginConfigBase):
-    """Token 单位配置。"""
+    """用量单位配置。"""
 
-    __ui_label__ = "Token 单位"
+    __ui_label__ = "用量单位"
     __ui_icon__ = "tag"
     __ui_order__ = 1
 
     unit_name: str = Field(
-        default="Token",
-        description="Token 的显示单位名称，会出现在文本报告、图片报告与工具返回中，可随意改成 鸡蛋 / 词元 / 白饭 等",
+        default=_DEFAULT_UNIT_NAME,
+        description="用量的显示单位名称，会出现在文本报告、图片报告与工具返回中，可随意改成 鸡蛋 / 词元 / 白饭 等；"
+        f"留空时回退为默认值 {_DEFAULT_UNIT_NAME}",
         json_schema_extra={
             "label": "单位名称",
-            "hint": "改这里就能把报告里的 Token 换成 鸡蛋/词元/白饭 等，例如填「鸡蛋」后显示「1.23 万 鸡蛋」",
+            "hint": "改这里就能把报告里的用量单位换成 鸡蛋/词元/白饭 等，例如填「鸡蛋」后显示「1.23 万 鸡蛋」；留空则回退为 Token",
             "placeholder": "例如：Token、鸡蛋、词元",
         },
     )
+
+    @field_validator("unit_name", mode="before")
+    @classmethod
+    def _normalize_unit_name(cls, value: Any) -> str:
+        """规范化单位名：去首尾空白，留空时回退为默认单位名。
+
+        单位名为空会让报告出现「1.23 万 」「/小时」「模型排行（按  排序）」这类残缺文案，
+        因此这里统一兜到默认值，并记一条警告，便于发现配置漏填而不是静默产出坏报告。
+        """
+
+        normalized = str(value or "").strip()
+        if normalized:
+            return normalized
+        logger.warning("[token_usage_report] 用量单位名为空，已回退为默认值「%s」", _DEFAULT_UNIT_NAME)
+        return _DEFAULT_UNIT_NAME
 
 
 class ModelAliasSection(PluginConfigBase):
@@ -164,7 +189,7 @@ class ReportSection(PluginConfigBase):
         "没写的不会出现在报告里（只用了部分占位符时，空出来的行会被自动压掉）。"
         "可用占位符（共 54 个）——"
         "基础：{date} 报告时间、{unit_name} 单位名、{scope} 范围标识、{scope_name} 范围中文、{total_scope} 总计口径；"
-        "窗口（每个窗口 4 个：Token 带单位 / _raw 纯数字 / _requests 请求数 / _cost 花费）："
+        "窗口（每个窗口 4 个：用量带单位 / _raw 纯数字 / _requests 请求数 / _cost 花费）："
         "{today} {today_raw} {today_requests} {today_cost}、"
         "{this_week} {this_week_raw} {this_week_requests} {this_week_cost}、"
         "{this_month} {this_month_raw} {this_month_requests} {this_month_cost}、"
@@ -227,10 +252,11 @@ class ReportSection(PluginConfigBase):
     )
     llm_prompt: str = Field(
         default=_DEFAULT_LLM_PROMPT,
-        description="转述任务说明（不含数据本体与人格）；人格会拼在它前面，统计数据会附在它后面",
+        description="转述任务说明（不含数据本体与人格）；人格会拼在它前面，统计数据会附在它后面。"
+        "支持占位符 {unit_name}（会被替换成 token_unit.unit_name）",
         json_schema_extra={
             "label": "转述提示词",
-            "hint": "只写任务说明即可；系统会自动把「人格」拼在前面、「统计数据」附在后面",
+            "hint": "只写任务说明即可；系统会自动把「人格」拼在前面、「统计数据」附在后面。可用 {unit_name} 引用当前单位名",
             "x-widget": "textarea",
             "rows": 5,
             "placeholder": "请用自然、口语化的中文把数据转述给群友…",
@@ -471,7 +497,7 @@ class RenderSection(PluginConfigBase):
     )
     show_details: bool = Field(
         default=True,
-        description="是否在报告末尾输出模型用量排行表（模型名、Token、调用次数、费用、平均耗时、占比）",
+        description="是否在报告末尾输出模型用量排行表（模型名、用量、调用次数、费用、平均耗时、占比）",
         json_schema_extra={
             "label": "输出模型用量排行表",
             "hint": "开启后图片末尾会带上模型排行表（含 # 名次）；关闭后只保留图表与总览指标。文本报告的 {details} 占位符同样受它控制",
@@ -509,7 +535,7 @@ class ChartSection(PluginConfigBase):
         json_schema_extra={
             "label": "趋势图样式",
             "hint": "可选 bar（仅条形）/ line（仅曲线）/ bar_line（条形+曲线叠加，默认）：叠加时条形半透明、"
-            "曲线为平滑曲线并带数据点；五个趋势图（Token/总花费/各模型/各模块/各聊天流）统一生效",
+            "曲线为平滑曲线并带数据点；五个趋势图（用量/总花费/各模型/各模块/各聊天流）统一生效",
         },
     )
     bar_days: int = Field(
@@ -533,8 +559,8 @@ class ChartSection(PluginConfigBase):
     )
     bar_tokens: bool = Field(
         default=True,
-        description="「Token 趋势」条形图：横轴时间、纵轴 Token 总量",
-        json_schema_extra={"label": "条形图：Token 趋势", "hint": "横轴时间、纵轴 Token 总量"},
+        description="「用量趋势」条形图：横轴时间、纵轴用量总量",
+        json_schema_extra={"label": "条形图：用量趋势", "hint": "横轴时间、纵轴用量总量"},
     )
     bar_cost: bool = Field(
         default=True,
@@ -558,18 +584,18 @@ class ChartSection(PluginConfigBase):
     )
     pie_module_tokens: bool = Field(
         default=True,
-        description="「模块 Token 占比」扇形图：计划器/回复器/图片/记忆/表情/插件/其他 的 Token 与请求占比",
-        json_schema_extra={"label": "扇形图：模块 Token 占比", "hint": "展示 计划器/回复器/图片/记忆/表情/插件/其他 各占多少"},
+        description="「模块用量占比」扇形图：计划器/回复器/图片/记忆/表情/插件/其他 的用量与请求占比",
+        json_schema_extra={"label": "扇形图：模块用量占比", "hint": "展示 计划器/回复器/图片/记忆/表情/插件/其他 各占多少"},
     )
     pie_module_cost: bool = Field(
         default=True,
-        description="「模块花费分布」扇形图：各模块的花费占比（只统计 Token 排名靠前的模块）",
-        json_schema_extra={"label": "扇形图：模块花费分布", "hint": "各模块花费占比；只统计 Token 靠前的若干模块"},
+        description="「模块花费分布」扇形图：各模块的花费占比（只统计用量排名靠前的模块）",
+        json_schema_extra={"label": "扇形图：模块花费分布", "hint": "各模块花费占比；只统计用量靠前的若干模块"},
     )
     pie_model_tokens: bool = Field(
         default=True,
-        description="「模型 Token 占比」扇形图：各模型的 Token 占比",
-        json_schema_extra={"label": "扇形图：模型 Token 占比", "hint": "各模型 Token 占比（显示别名）"},
+        description="「模型用量占比」扇形图：各模型的用量占比",
+        json_schema_extra={"label": "扇形图：模型用量占比", "hint": "各模型用量占比（显示别名）"},
     )
     pie_model_cost: bool = Field(
         default=True,

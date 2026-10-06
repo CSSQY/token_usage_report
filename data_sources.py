@@ -54,20 +54,9 @@ _WINDOW_DEFINITION_NOTE = (
 
 _AGGREGATION_LAG_NOTE = "最近 15 分钟内的调用可能还没进表"
 
-_CHAT_SCOPE_NOTE = (
-    "总量包含全部模块：聊天链路（计划器 + 回复器）之外的记忆抽取、embedding、图片理解、"
-    "表情向量等后台流水线同样计入 Token，核对时请以「聊天链路 Token」为准"
-)
-
 _TOTAL_DEFINITION_NOTE = (
-    "总计 = 供应商上报的 total_tokens 之和；部分供应商把缓存 / 推理 token 也算进 total，"
+    "总计 = 供应商上报的 total_tokens 之和；部分供应商把缓存 / 推理用量也算进 total，"
     "所以总计可能略大于「输入 + 输出」（宿主 WebUI 的合计用的是输入 + 输出，两边天然有零点几个百分点的差）"
-)
-
-_MODULE_GRANULARITY_NOTE = (
-    "模块 Token 占比按完整请求类型（request_type，如 maisaka.replyer）归类；"
-    "模块花费受宿主能力限制只能按 module_name（首个「.」之前的部分）归类，"
-    "粒度更粗——maisaka.planner / maisaka.replyer / maisaka.mid_term_memory 在花费里会合并成 maisaka"
 )
 
 _ONLINE_TIME_TABLE = "OnlineTime"
@@ -83,10 +72,39 @@ _ONLINE_TIME_ROW_LIMIT = 20000
 """在线时长明细的读取上限；行数与「有记录的在线时段数」同阶，正常远低于该值。"""
 
 
-def _module_granularity_note(top_modules: int) -> str:
-    """模块口径说明：Token 与花费用的粒度不同，且花费只覆盖前 N 个模块。"""
+def _chat_scope_note(unit_name: str) -> str:
+    """聊天链路口径说明：总量含后台流水线，核对「实际用了多少」请看聊天链路那一格。
 
-    return f"{_MODULE_GRANULARITY_NOTE}；模块花费只统计 Token 前 {top_modules} 个模块，其余归入「其他」"
+    Args:
+        unit_name: 配置的用量单位名，用于替换文案里的「Token」。
+
+    Returns:
+        str: 脚注文本。
+    """
+
+    return (
+        "总量包含全部模块：聊天链路（计划器 + 回复器）之外的记忆抽取、embedding、图片理解、"
+        f"表情向量等后台流水线同样计入 {unit_name}，核对时请以「聊天链路 {unit_name}」为准"
+    )
+
+
+def _module_granularity_note(top_modules: int, unit_name: str) -> str:
+    """模块口径说明：用量与花费用的粒度不同，且花费只覆盖前 N 个模块。
+
+    Args:
+        top_modules: 模块花费统计覆盖的模块个数。
+        unit_name: 配置的用量单位名，用于替换文案里的「Token」。
+
+    Returns:
+        str: 脚注文本。
+    """
+
+    return (
+        f"模块 {unit_name} 占比按完整请求类型（request_type，如 maisaka.replyer）归类；"
+        "模块花费受宿主能力限制只能按 module_name（首个「.」之前的部分）归类，"
+        "粒度更粗——maisaka.planner / maisaka.replyer / maisaka.mid_term_memory 在花费里会合并成 maisaka；"
+        f"模块花费只统计 {unit_name} 前 {top_modules} 个模块，其余归入「其他」"
+    )
 
 
 def _window_definition(window_key: str) -> str:
@@ -189,12 +207,13 @@ class _GlobalCollector:
         """执行完整的全局采集流程。"""
 
         statistics = self._ctx.statistics.local
+        unit_name = self._config.token_unit.unit_name
         chart_granularity = self._chart_granularity
         chart_days, chart_bucket = self._resolve_chart_range(chart_granularity)
         self._metrics.chart_granularity = chart_granularity
 
         token_window = await self._fetch_series(
-            "Token 趋势（小时）",
+            f"{unit_name} 趋势（小时）",
             lambda: statistics.token_trend(days=self._window_days, bucket=self._window_bucket),
         )
         cost_window = await self._fetch_series(
@@ -208,7 +227,8 @@ class _GlobalCollector:
         )
         if self._window is None:
             token_total = await self._fetch_series(
-                "Token 趋势（天）", lambda: statistics.token_trend(days=self._total_days, bucket=self._total_bucket)
+                f"{unit_name} 趋势（天）",
+                lambda: statistics.token_trend(days=self._total_days, bucket=self._total_bucket),
             )
             cost_total = await self._fetch_series(
                 "花费趋势（天）",
@@ -503,7 +523,7 @@ class _GlobalCollector:
         statistics = self._ctx.statistics.local
         days, bucket = self._total_days, self._total_bucket
         token_series = await self._fetch_series(
-            "模型 Token 趋势",
+            f"模型 {self._config.token_unit.unit_name} 趋势",
             lambda: statistics.model_trend(days=days, bucket=bucket, metric="token", top_models=_MAX_HOST_LIMIT),
         )
         request_series = await self._fetch_series(
@@ -941,7 +961,7 @@ class _GlobalCollector:
             # 单窗口模式：用带时间戳的「按请求类型 Token 序列」精确统计窗口内各模块，
             # 一次调用覆盖全部请求类型（不受 limits.top_modules 限制），同时避免逐模块取数
             series = await self._fetch_series(
-                "模块 Token 趋势",
+                f"模块 {self._config.token_unit.unit_name} 趋势",
                 lambda: statistics.token_trend(
                     days=self._total_days,
                     bucket=self._total_bucket,
@@ -1000,7 +1020,7 @@ class _GlobalCollector:
             merged = filter_and_merge_series(
                 [str(item) for item in chart_token_series.get("timestamps", [])],
                 {
-                    "Token": [
+                    self._config.token_unit.unit_name: [
                         float(item or 0)
                         for item in chart_token_series.get("values_by_key", {}).get("total_tokens", [])
                     ]
@@ -1048,14 +1068,15 @@ class _GlobalCollector:
         """填充报告脚注（统计口径说明）。"""
 
         top_modules = max(1, min(self._config.limits.top_modules, _MAX_HOST_LIMIT))
+        unit_name = self._config.token_unit.unit_name
         if self._window is None:
             self._metrics.total_scope_note = "最近 365 天"
             self._metrics.notes = [
                 "总计口径：最近 365 天（宿主统计能力上限）",
                 f"窗口口径：{_WINDOW_DEFINITION_NOTE}",
-                _CHAT_SCOPE_NOTE,
+                _chat_scope_note(unit_name),
                 _TOTAL_DEFINITION_NOTE,
-                _module_granularity_note(top_modules),
+                _module_granularity_note(top_modules, unit_name),
                 "消息数 / 回复数只覆盖消息量前 50 会话与调用量前 50 工具",
                 f"数据来自宿主的按小时聚合表，宿主每 15 分钟刷新一次：{_AGGREGATION_LAG_NOTE}",
             ]
@@ -1066,9 +1087,9 @@ class _GlobalCollector:
         notes = [
             f"本次报告只统计「{label}」（{_window_definition(self._window_key)}）："
             "时间窗口、趋势图、模型排行与占比分布均为该窗口数据",
-            _CHAT_SCOPE_NOTE,
+            _chat_scope_note(unit_name),
             _TOTAL_DEFINITION_NOTE,
-            _module_granularity_note(top_modules),
+            _module_granularity_note(top_modules, unit_name),
             "消息数 / 回复数只覆盖消息量前 50 会话与调用量前 50 工具",
             f"数据来自宿主的按小时聚合表，宿主每 15 分钟刷新一次：{_AGGREGATION_LAG_NOTE}",
         ]

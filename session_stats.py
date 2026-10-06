@@ -114,7 +114,7 @@ class _SessionCollector:
         )
         metrics.notes = [
             "总计口径：该会话的全部历史记录（受 limits.max_session_rows 行数上限约束）",
-            "缓存命中 / 未命中 Token 来自会话调用明细（全局视图的宿主聚合表不提供该字段）",
+            f"缓存命中 / 未命中 {metrics.unit_name} 来自会话调用明细（全局视图的宿主聚合表不提供该字段）",
             "会话视图不包含消息数 / 回复数 / 在线时长（宿主无按会话过滤这些指标的能力）",
         ]
         metrics.total_scope_note = "该会话全部历史记录"
@@ -413,7 +413,7 @@ class _SessionCollector:
         if chart_config.bar_tokens:
             merged = filter_and_merge_series(
                 timestamps,
-                {"Token": token_values},
+                {self._config.token_unit.unit_name: token_values},
                 granularity=granularity,
                 cutoff=cutoff,
             )

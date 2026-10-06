@@ -142,7 +142,7 @@
 | 分节 | 默认状态 | 说明 |
 |---|---|---|
 | `[plugin]` | `enabled = true` | 插件加载即生效 |
-| `[token_unit]` | `unit_name = "Token"` | 想换成 鸡蛋/词元 直接改这一个字段 |
+| `[token_unit]` | `unit_name = "Token"` | 想换成 鸡蛋/词元 直接改这一个字段；报告标题、总览指标、图表标题、图例、脚注与工具返回里的单位名会**全部**跟着替换 |
 | `[model_aliases]` | 空列表 | 可选；不配就显示宿主里的原始模型名 |
 | `[report]` | `enabled = false`、`mode = "template"` | 定时播报默认关闭（避免未经确认就发消息）；要开启需先填 `target_groups` / `target_users` |
 | `[command]` | `enabled = true`、`permission_mode = "whitelist"`、`use_image = true`、`tool_allowed_scopes = ["current"]` | **默认只允许白名单里的群用指令**：先把自己的群号填进 `whitelist_groups`（或把 `permission_mode` 改成 `all` 全面开放）；LLM 工具默认只能查当前对话 |
@@ -161,13 +161,15 @@
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `enabled` | bool | `true` | 是否启用插件 |
-| `config_version` | str | `"1.8.0"` | 配置版本，升级配置结构时递增 |
+| `config_version` | str | `"1.8.4"` | 配置版本，升级配置结构时递增 |
 
 ### 4.2 `[token_unit]`
 
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `unit_name` | str | `"Token"` | Token 的显示单位名称，例如 鸡蛋 / 词元 / 白饭 |
+| `unit_name` | str | `"Token"` | 用量的显示单位名称，例如 鸡蛋 / 词元 / 白饭；**留空（或全空白）会回退为 `Token`** 并记一条 warning 日志 |
+
+**替换范围**：改这一个字段后，文本报告与图片报告里的**标题、总览指标名、图表标题、图例、模型排行表头、脚注口径说明**，以及 LLM 工具返回的 `unit_name` / 权限提示文案都会一起替换。`report.llm_prompt` 里可以用 `{unit_name}` 占位符引用它（例如「把下面这份 {unit_name} 数据转述给大家」）。
 
 ### 4.3 `[model_aliases]`
 
@@ -485,3 +487,5 @@ font_services = [
 | 1.8.0 | **审核整改（隐私与权限边界）**：`command.permission_mode` 默认由 `all` 收紧为 `whitelist`（只有白名单内的群可用指令）、`render.anonymize` 默认由 `false` 收紧为 `true`（群名/昵称默认匿名化）；LLM 工具 `query_token_usage` 补上与 `/token` 一致的黑白名单判定，并新增 `command.tool_allowed_scopes`（默认只有 `current`）限制工具可查范围，工具不再声明 `stream_id` 参数（会话上下文由宿主注入、模型无法自行指定）；会话视图新增结构守卫——取到行却读不到已知字段时**明确报错**（「宿主 ModelUsage 表结构与插件不兼容」），不再用 `row.get(...) or 0` 静默兜成 0；README 补充 `render.allow_network` / `font_services` 的安全说明、`render.html2png` 兼容写法依赖异常文案所对应的最低 SDK 版本，以及「会话视图依赖宿主内部表结构」的契约说明 |
 | 1.8.1 | 修复模块归类：宿主聚合表的 `module_name` 只保留首个「.」之前的部分，`maisaka.planner` / `maisaka.replyer`（Maisaka 主聊天链路）被压成 `maisaka` 归入「记忆」、`A_Memorix.ImageEmbedding` 被归入「记忆」而非「图片」，导致「聊天链路 Token」严重低估；现改为按**完整 request_type**（`group_by=type`）归类，会话视图同步；模块花费受宿主能力限制仍为 `module_name` 粒度并在脚注标注；README 与脚注补充「总计 = 供应商上报 total_tokens 之和，可能略大于输入 + 输出」「模块 Token / 模块花费粒度不同」等口径说明 |
 | 1.8.2 | 修复**在线时长**：`statistics.local.online_time_trend` 返回的 `SUM(duration_minutes)` 中该字段永不更新（每条恒 5 分钟），且按 `start_timestamp` 分桶会把跨越窗口起点的记录整条裁掉（长跑进程在「今日」窗口显示 **0 秒**）；现改为直读宿主 `online_time` 明细，按 `end - start` 与统计区间求交集累加，与宿主 WebUI 算法一致；`_manifest.json` 移除该能力的声明 |
+| 1.8.3 | 修复**单位名替换不彻底**：图片报告的「输入/输出 Token」「Token/时间」「缓存命中 Token」「聊天链路 Token」、图表标题、模型排行表头、Token 条形图图例，以及文本报告的模型排行/模块占比/详细数据表头、会话脚注、失败区块标签、工具权限提示、命令回执都写死了「Token」，现全部改为读取 `token_unit.unit_name`；`report.llm_prompt` 新增 `{unit_name}` 占位符，默认提示词改为「用量统计数据」；配置页「Token 单位」改名「用量单位」、图表开关标签由「Token」改为「用量」 |
+| 1.8.4 | 修复**单位名留空**：`token_unit.unit_name` 清空后会渲染出「1.23 万 」「/小时」「模型排行（按  排序）」这类残缺文案、图表图例名变成空串；现改为先去除首尾空白，留空（含全空白）时回退为默认值 `Token` 并记一条 warning 日志 |

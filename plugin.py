@@ -107,7 +107,8 @@ class TokenUsageReportPlugin(MaiBotPlugin):
     @Tool(
         "query_token_usage",
         description=(
-            "查询 Bot 自身消耗的 token 用量（受与 /token 指令相同的黑白名单限制，且只能查询「工具可查询范围」"
+            "查询 Bot 自身消耗的用量统计（单位名可在插件配置里自定义，见返回的 unit_name；"
+            "受与 /token 指令相同的黑白名单限制，且只能查询「工具可查询范围」"
             "里允许的范围，默认只允许当前对话）。scope 可选：current=当前对话（默认，取本次调用的会话上下文）、"
             "all=全部会话、group=指定群聊（需传 target_id 群号）、user=指定用户（需传 target_id QQ 号）；"
             f"window 可选 {WINDOW_USAGE_HINT}（也支持 today/this_week/this_month/last_24h/last_7d/last_30d），"
@@ -168,7 +169,13 @@ class TokenUsageReportPlugin(MaiBotPlugin):
                 kwargs.get("user_id"),
                 normalized_scope,
             )
-            return {"success": False, "content": "当前会话没有查询 Token 用量的权限（与 /token 同一套黑白名单）"}
+            return {
+                "success": False,
+                "content": (
+                    f"当前会话没有查询 {self.config.token_unit.unit_name} 用量的权限"
+                    "（与 /token 同一套黑白名单）"
+                ),
+            }
 
         allowed_scopes = _normalize_scope_list(self.config.command.tool_allowed_scopes)
         if normalized_scope not in allowed_scopes:
@@ -236,7 +243,7 @@ class TokenUsageReportPlugin(MaiBotPlugin):
 
     @Command(
         "token_usage",
-        description="统计 Bot 的 Token 消耗（可指定范围与时间，例如 /token all 今日、/token 群 123456 本周）",
+        description="统计 Bot 的模型用量消耗（可指定范围与时间，例如 /token all 今日、/token 群 123456 本周）",
         pattern=(
             r"^/(?:token|tokens)"
             r"(?:\s+(?P<arg1>\S+))?"
@@ -298,7 +305,7 @@ class TokenUsageReportPlugin(MaiBotPlugin):
         )
         if not sent:
             return False, "统计结果发送失败", True
-        return True, "已发送 Token 统计", True
+        return True, f"已发送 {self.config.token_unit.unit_name} 统计", True
 
     def _text_for_delivery(self, text: str, *, has_image: bool) -> str:
         """决定是否随图片一起发送文字。
