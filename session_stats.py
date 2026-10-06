@@ -288,7 +288,7 @@ class _SessionCollector:
                     window_latency_sum[key] += time_cost
                     window_latency_count[key] += 1
 
-            module_name = resolve_module_group(_module_name_of(row), self._module_group_map)
+            module_name = resolve_module_group(_request_type_of(row), self._module_group_map)
             module_row = module_values.get(module_name)
             if module_row is None:
                 module_values[module_name] = ModuleUsageRow(name=module_name, tokens=tokens, requests=1, cost=cost)
@@ -475,15 +475,15 @@ def _stream_display_name(stream: Dict[str, Any]) -> str:
     return ""
 
 
-def _module_name_of(row: Dict[str, Any]) -> str:
-    """从明细行中提取模块名（``request_type`` 首个 ``.`` 之前的部分）。"""
+def _request_type_of(row: Dict[str, Any]) -> str:
+    """从明细行中提取完整请求类型，用于模块分组。
 
-    request_type = str(row.get("request_type") or "").strip()
-    if not request_type:
-        return "unknown"
-    if "." in request_type:
-        return request_type.split(".", 1)[0]
-    return request_type
+    宿主聚合表只给到 ``module_name``（首个 ``.`` 之前的部分），但会话视图直读调用明细，
+    能拿到完整 ``request_type``；只有用完整值才能区分 ``maisaka.planner`` /
+    ``maisaka.replyer`` 与 ``maisaka.mid_term_memory``，否则它们会被一并归入「记忆」。
+    """
+
+    return str(row.get("request_type") or "").strip() or "unknown"
 
 
 def _model_name_of(row: Dict[str, Any]) -> str:

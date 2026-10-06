@@ -1,0 +1,47 @@
+# ── 插件运行时生成的文件（不应提交）──
+# 首次加载时由 Runner 依据配置模型默认值生成，每个部署环境各不相同
+/config.toml
+# 旧式插件数据目录；正式持久化目录在宿主根目录的 data/plugins/<plugin_id>/
+/data/
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ── 虚拟环境 ──
+.venv/
+venv/
+env/
+ENV/
+
+# ── 日志与临时产物 ──
+logs/
+*.log
+*.tmp
+*.bak
+*~
+
+# ── 编辑器与 IDE ──
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.sublime-project
+*.sublime-workspace
+
+# ── 操作系统 ──
+.DS_Store
+Thumbs.db
+desktop.ini

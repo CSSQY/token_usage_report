@@ -25,7 +25,8 @@ UNKNOWN_GROUP_NAME = "其他"
 MODULE_GROUP_ORDER: Tuple[str, ...] = ("计划器", "回复器", "图片", "记忆", "表情", "插件")
 
 CHAT_GROUP_NAMES: Tuple[str, ...] = ("计划器", "回复器")
-"""聊天链路的模块分组（对应宿主 ``task_name`` 里的 replyer / planner）。
+"""聊天链路的模块分组（对应宿主 ``request_type`` 里的 ``planner`` / ``replyer`` 系列，
+包括 Maisaka 主链路的 ``maisaka.planner`` / ``maisaka.replyer``）。
 
 其余分组（记忆 / 图片 / 表情 / 插件）是后台流水线（记忆抽取、embedding、视觉理解等），
 不随聊天量走，因此报告会把「聊天链路」单独标出来，便于与直觉或宿主页面口径对齐。
@@ -525,8 +526,13 @@ def sum_series_in_window(timestamps: List[str], values: List[float], predicate: 
 def resolve_module_group(module_name: str, group_map: Dict[str, str]) -> str:
     """把模块名映射为配置中的中文分组名。
 
+    传入的应当是**完整请求类型**（``request_type``，如 ``maisaka.replyer``）：
+    宿主的 ``module_name`` 只保留首个 ``.`` 之前的部分，会把 ``maisaka.*`` 全部压成
+    ``maisaka``，导致带点的前缀（``maisaka.replyer`` / ``A_Memorix.ImageEmbedding``）永远匹配不上。
+    只有宿主花费能力因为只支持 ``module_name`` 过滤，才会退化成传截断名。
+
     Args:
-        module_name: 宿主聚合表中的模块名（``request_type`` 首个 ``.`` 之前的部分）。
+        module_name: 完整请求类型；模块花费场景下为 ``module_name``（首个 ``.`` 之前的部分）。
         group_map: 「模块名前缀 → 分组名」映射，按配置顺序遍历。
 
     Returns:

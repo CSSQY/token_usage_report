@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "cssqy.token-usage-report",
-  "version": "1.8.0",
+  "version": "1.8.2",
   "name": "Token 用量统计与播报",
   "description": "统计 Bot 的 Token 消耗，支持会话维度筛选、图片报告、每日定时播报与 LLM 风格化转述",
   "author": {
@@ -46,7 +46,6 @@
     "statistics.local.token_distribution",
     "statistics.local.message_trend",
     "statistics.local.tool_trend",
-    "statistics.local.online_time_trend",
     "database.get",
     "database.count"
   ],

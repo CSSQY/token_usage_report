@@ -66,9 +66,9 @@ class PluginSection(PluginConfigBase):
         json_schema_extra={"label": "启用插件", "hint": "关闭后 /token、LLM 工具与定时播报全部停止"},
     )
     config_version: str = Field(
-        default="1.8.0",
+        default="1.8.2",
         description="配置结构版本，由插件维护；升级配置结构时递增，用户一般不需要改动",
-        json_schema_extra={"label": "配置版本", "hint": "插件用它判断是否升级配置结构，一般不用改", "placeholder": "1.8.0"},
+        json_schema_extra={"label": "配置版本", "hint": "插件用它判断是否升级配置结构，一般不用改", "placeholder": "1.8.2"},
     )
 
 
@@ -597,9 +597,9 @@ class ModuleGroupSection(PluginConfigBase):
 
     planner: List[str] = Field(
         default=["planner", "maisaka.plan", "plan"],
-        description="归入「计划器」的模块名前缀；宿主模块名是请求类型中第一个「.」之前的部分",
+        description="归入「计划器」的请求类型前缀；按完整 request_type 前缀匹配（如 maisaka.plan 可命中 maisaka.planner）",
         json_schema_extra={
-            **_list_field("planner", "填模块名前缀后点 + 添加；命中即归入「计划器」"),
+            **_list_field("planner", "填请求类型前缀后点 + 添加；命中即归入「计划器」"),
             "label": "计划器",
         },
     )

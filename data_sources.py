@@ -59,6 +59,35 @@ _CHAT_SCOPE_NOTE = (
     "表情向量等后台流水线同样计入 Token，核对时请以「聊天链路 Token」为准"
 )
 
+_TOTAL_DEFINITION_NOTE = (
+    "总计 = 供应商上报的 total_tokens 之和；部分供应商把缓存 / 推理 token 也算进 total，"
+    "所以总计可能略大于「输入 + 输出」（宿主 WebUI 的合计用的是输入 + 输出，两边天然有零点几个百分点的差）"
+)
+
+_MODULE_GRANULARITY_NOTE = (
+    "模块 Token 占比按完整请求类型（request_type，如 maisaka.replyer）归类；"
+    "模块花费受宿主能力限制只能按 module_name（首个「.」之前的部分）归类，"
+    "粒度更粗——maisaka.planner / maisaka.replyer / maisaka.mid_term_memory 在花费里会合并成 maisaka"
+)
+
+_ONLINE_TIME_TABLE = "OnlineTime"
+"""宿主在线时长明细表（实际表名 ``online_time``）。
+
+宿主还提供 ``statistics.local.online_time_trend`` 能力，但它返回的是
+``SUM(duration_minutes)``，而该字段只在建记录时写死为 5、之后心跳只更新
+``end_timestamp``，既算不准时长，又按 ``start_timestamp`` 分桶（跨越窗口起点的
+记录会被整条裁掉）。因此这里直读明细，按上下线时间差自行计算。
+"""
+
+_ONLINE_TIME_ROW_LIMIT = 20000
+"""在线时长明细的读取上限；行数与「有记录的在线时段数」同阶，正常远低于该值。"""
+
+
+def _module_granularity_note(top_modules: int) -> str:
+    """模块口径说明：Token 与花费用的粒度不同，且花费只覆盖前 N 个模块。"""
+
+    return f"{_MODULE_GRANULARITY_NOTE}；模块花费只统计 Token 前 {top_modules} 个模块，其余归入「其他」"
+
 
 def _window_definition(window_key: str) -> str:
     """返回窗口的口径说明（日历零点起算 / 滚动时长）。"""
@@ -728,62 +757,120 @@ class _GlobalCollector:
         self._metrics.replies = 0
 
     async def _fill_online_time(self) -> None:
-        """填充在线时长（小时）。"""
+        """填充在线时长（小时）。
 
-        statistics = self._ctx.statistics.local
-        series = await self._fetch_series(
-            "在线时长趋势",
-            lambda: statistics.online_time_trend(days=self._total_days, bucket=self._total_bucket),
-        )
-        if series is None:
+        改直读宿主 ``online_time`` 明细，按每条记录的 ``end - start`` 与统计区间求交集后累加，
+        与宿主 WebUI 的算法一致（[statistics_service.py] 里同样是 ``max(start, 区间起点)`` /
+        ``min(end, 区间终点)``）。宿主的 ``online_time_trend`` 能力用不了：
+        ``SUM(duration_minutes)`` 因该字段永不更新而失真，且按 ``start_timestamp`` 分桶，
+        会导致「跨越窗口起点的那条记录」整条被裁掉——这正是长跑进程在「今日」窗口显示 0 秒的原因。
+        """
+
+        rows = await self._load_online_time_rows()
+        if rows is None:
             return
-        online_values = series.get("values_by_key", {}).get("online_hours", [])
-        self._metrics.online_hours = float(sum(float(item or 0) for item in online_values))
+        start, end = self._online_time_range()
+        self._metrics.online_hours = _sum_online_hours(rows, start, end)
+
+    def _online_time_range(self) -> Tuple[datetime, datetime]:
+        """返回在线时长的统计区间：单窗口模式为窗口起点至今，否则与总计口径一致（最近 N 天）。"""
+
+        if self._window is not None:
+            return self._window.start, self._now
+        return self._now - timedelta(days=self._total_days), self._now
+
+    async def _load_online_time_rows(self) -> Optional[List[Dict[str, Any]]]:
+        """读取宿主在线时长明细；失败或结构异常时标记区块不可用。
+
+        ``database.get`` 只支持等值过滤，拿不到「区间内」的行，因此按 ``end_timestamp``
+        倒序取最近若干条后在插件内裁剪；行数与「有记录的在线时段数」同阶
+        （持续在线时复用同一条记录、只更新结束时间），不会爆量。
+        """
+
+        try:
+            rows = await self._ctx.db.get(
+                _ONLINE_TIME_TABLE,
+                order_by=["-end_timestamp"],
+                limit=_ONLINE_TIME_ROW_LIMIT,
+            )
+        except Exception as exc:
+            logger.error("[token_usage_report] 读取在线时长明细失败: %s", exc)
+            self._metrics.unavailable.append("在线时长")
+            return None
+        if not isinstance(rows, list):
+            logger.error("[token_usage_report] 在线时长明细返回结构异常：%s", type(rows).__name__)
+            self._metrics.unavailable.append("在线时长")
+            return None
+        if len(rows) >= _ONLINE_TIME_ROW_LIMIT:
+            logger.warning(
+                "[token_usage_report] 在线时长明细达到读取上限 %d 条，更早的在线时段可能未计入",
+                _ONLINE_TIME_ROW_LIMIT,
+            )
+        return [row for row in rows if isinstance(row, dict)]
 
     async def _fill_module_distribution(self) -> List[str]:
-        """取得按 Token 降序的模块名清单与「原始模块名 → Token」明细。
+        """填充模块占比，并返回供「模块花费」取数用的 ``module_name`` 清单。
+
+        宿主聚合表有两个粒度，必须分别使用：
+
+        - ``request_type``（完整请求类型，如 ``maisaka.replyer``）：Token 与请求次数按它归类。
+          宿主的 ``module_name`` 只保留首个 ``.`` 之前的部分，会把 ``maisaka.planner`` /
+          ``maisaka.replyer`` 一并压成 ``maisaka``，与 ``maisaka.mid_term_memory`` 无法区分，
+          导致「聊天链路」被算进「记忆」；只有完整 ``request_type`` 才能正确归类。
+        - ``module_name``（首个 ``.`` 之前）：宿主 ``model_trend`` 只支持按它过滤花费，
+          所以「模块花费」沿用这个粒度，返回值即该粒度的清单。
 
         单窗口模式下 ``token_distribution`` 只能按「最近 N 天」取数、无法裁剪到窗口，
-        因此这里只借用它的模块名清单，Token 明细改由带时间戳的按模块序列统计
+        因此这里只借用它的清单，Token 明细改由带时间戳的按请求类型序列统计
         （见 :meth:`_fill_module_series`）；模块占比饼图统一在那边生成。
         """
 
         statistics = self._ctx.statistics.local
-        distribution = await self._fetch_distribution(
+        type_distribution = await self._fetch_distribution(
             "模块分布",
+            lambda: statistics.token_distribution(
+                days=self._total_days, group_by="type", top_items=_MAX_HOST_LIMIT
+            ),
+        )
+        module_distribution = await self._fetch_distribution(
+            "模块花费清单",
             lambda: statistics.token_distribution(
                 days=self._total_days, group_by="module", top_items=_MAX_HOST_LIMIT
             ),
         )
-        if distribution is None:
-            return []
 
-        pies = distribution.get("pies", [])
-        token_items = _extract_pie_items(pies, 0)
-        request_map = {name: value for name, value in _extract_pie_items(pies, 1)}
-        self._raw_module_tokens = {module_name: token_value for module_name, token_value in token_items}
+        if type_distribution is not None:
+            pies = type_distribution.get("pies", [])
+            token_items = _extract_pie_items(pies, 0)
+            request_map = {name: value for name, value in _extract_pie_items(pies, 1)}
+            self._raw_module_tokens = {request_type: token_value for request_type, token_value in token_items}
 
-        if self._window is None:
-            grouped_requests: Dict[str, float] = {}
-            for module_name, _token_value in token_items:
-                group_name = resolve_module_group(module_name, self._module_group_map)
-                grouped_requests[group_name] = grouped_requests.get(group_name, 0.0) + request_map.get(
-                    module_name, 0.0
+            if self._window is None:
+                grouped_requests: Dict[str, float] = {}
+                for request_type, _token_value in token_items:
+                    group_name = resolve_module_group(request_type, self._module_group_map)
+                    grouped_requests[group_name] = grouped_requests.get(group_name, 0.0) + request_map.get(
+                        request_type, 0.0
+                    )
+
+                self._metrics.pies["module_requests"] = [
+                    PieSlice(name=name, value=value) for name, value in ordered_group_items(grouped_requests)
+                ]
+
+            unmapped = sorted(
+                request_type
+                for request_type, _value in token_items
+                if resolve_module_group(request_type, self._module_group_map) == UNKNOWN_GROUP_NAME
+            )
+            if unmapped:
+                logger.info(
+                    "[token_usage_report] 未被模块分组覆盖的请求类型（已归入「其他」）：%s", ", ".join(unmapped)
                 )
 
-            self._metrics.pies["module_requests"] = [
-                PieSlice(name=name, value=value) for name, value in ordered_group_items(grouped_requests)
-            ]
-
-        unmapped = sorted(
-            module_name
-            for module_name, _value in token_items
-            if resolve_module_group(module_name, self._module_group_map) == UNKNOWN_GROUP_NAME
-        )
-        if unmapped:
-            logger.info("[token_usage_report] 未被模块分组覆盖的模块名（已归入「其他」）：%s", ", ".join(unmapped))
-
-        return [module_name for module_name, _value in sorted(token_items, key=lambda item: -item[1])]
+        if module_distribution is None:
+            return []
+        module_items = _extract_pie_items(module_distribution.get("pies", []), 0)
+        return [module_name for module_name, _value in sorted(module_items, key=lambda item: -item[1])]
 
     async def _fill_module_series(
         self,
@@ -797,13 +884,14 @@ class _GlobalCollector:
 
         宿主没有「按模块聚合」的时间序列能力，因此这里对 Token 排名前 N 的模块逐个调用
         ``model_trend(module_name=M)``（N 由 ``limits.top_modules`` 控制）。
+        传入的 ``module_names`` 是 ``module_name``（首个「.」之前）粒度——宿主花费能力只支持该粒度。
         单窗口模式额外取一份 Token 序列，让模块 Token 占比也收敛到窗口内。
 
         Args:
             chart_days: 条形图取数天数。
             chart_bucket: 条形图取数桶粒度。
             chart_granularity: 条形图颗粒度。
-            module_names: 按 Token 降序的模块名清单。
+            module_names: 按 Token 降序的 ``module_name`` 清单。
         """
 
         statistics = self._ctx.statistics.local
@@ -850,14 +938,14 @@ class _GlobalCollector:
             module_cost_totals[display_name] = module_cost_totals.get(display_name, 0.0) + sum(totals)
 
         if self._window is not None:
-            # 单窗口模式：用带时间戳的「按模块 Token 序列」精确统计窗口内各模块，
-            # 一次调用覆盖全部模块（不受 limits.top_modules 限制），同时避免逐模块取数
+            # 单窗口模式：用带时间戳的「按请求类型 Token 序列」精确统计窗口内各模块，
+            # 一次调用覆盖全部请求类型（不受 limits.top_modules 限制），同时避免逐模块取数
             series = await self._fetch_series(
                 "模块 Token 趋势",
                 lambda: statistics.token_trend(
                     days=self._total_days,
                     bucket=self._total_bucket,
-                    group_by="module",
+                    group_by="type",
                     top_items=_MAX_HOST_LIMIT,
                 ),
             )
@@ -966,8 +1054,9 @@ class _GlobalCollector:
                 "总计口径：最近 365 天（宿主统计能力上限）",
                 f"窗口口径：{_WINDOW_DEFINITION_NOTE}",
                 _CHAT_SCOPE_NOTE,
+                _TOTAL_DEFINITION_NOTE,
+                _module_granularity_note(top_modules),
                 "消息数 / 回复数只覆盖消息量前 50 会话与调用量前 50 工具",
-                f"模块花费只统计 Token 前 {top_modules} 个模块，其余归入「其他」",
                 f"数据来自宿主的按小时聚合表，宿主每 15 分钟刷新一次：{_AGGREGATION_LAG_NOTE}",
             ]
             return
@@ -978,8 +1067,9 @@ class _GlobalCollector:
             f"本次报告只统计「{label}」（{_window_definition(self._window_key)}）："
             "时间窗口、趋势图、模型排行与占比分布均为该窗口数据",
             _CHAT_SCOPE_NOTE,
+            _TOTAL_DEFINITION_NOTE,
+            _module_granularity_note(top_modules),
             "消息数 / 回复数只覆盖消息量前 50 会话与调用量前 50 工具",
-            f"模块花费只统计 Token 前 {top_modules} 个模块，其余归入「其他」",
             f"数据来自宿主的按小时聚合表，宿主每 15 分钟刷新一次：{_AGGREGATION_LAG_NOTE}",
         ]
         if self._window_bucket == "day":
@@ -1025,6 +1115,38 @@ def _sum_key(values_by_key: Dict[str, List[float]], key: str) -> float:
     """累加某个序列键的全部数值。"""
 
     return float(sum(float(item or 0) for item in values_by_key.get(key, [])))
+
+
+def _sum_online_hours(rows: Sequence[Dict[str, Any]], start: datetime, end: datetime) -> float:
+    """把在线时长明细累加成小时数（只计入与 ``[start, end]`` 的交集）。
+
+    每条记录取 ``max(起始, 区间起点)`` 与 ``min(结束, 区间终点)``，只有结束晚于开始时才计入，
+    这样跨越区间起点的长记录能正确算出「区间内的那一段」，与宿主 WebUI 的口径一致。
+
+    Args:
+        rows: ``OnlineTime`` 明细行。
+        start: 统计区间起点。
+        end: 统计区间终点。
+
+    Returns:
+        float: 区间内的在线小时数。
+    """
+
+    total_seconds = 0.0
+    for row in rows:
+        record_start = parse_timestamp(row.get("start_timestamp"))
+        if record_start is None:
+            # 历史记录可能没有上线时间，与宿主 SQL 的 COALESCE(start_timestamp, timestamp) 保持一致
+            record_start = parse_timestamp(row.get("timestamp"))
+        record_end = parse_timestamp(row.get("end_timestamp"))
+        if record_start is None or record_end is None:
+            logger.warning("[token_usage_report] 在线时长记录缺少起止时间，已跳过：%s", row)
+            continue
+        overlap_start = max(record_start, start)
+        overlap_end = min(record_end, end)
+        if overlap_end > overlap_start:
+            total_seconds += (overlap_end - overlap_start).total_seconds()
+    return total_seconds / 3600.0
 
 
 def _group_module_tokens(

@@ -2,6 +2,23 @@
 
 本文件记录 `cssqy.token-usage-report` 的版本变更。每版分为**主要功能**（用户可感知的新能力）与**细节**（修复、行为调整、插件 SDK / API 适配）两部分，一条一行。
 
+## [1.8.2]
+
+### 细节
+
+- 修复在线时长：此前取宿主的 `statistics.local.online_time_trend` 能力，它返回 `SUM(duration_minutes)`——该字段只在建记录时写死为 5、之后心跳只更新 `end_timestamp`，所以既算不准时长（每条记录恒 5 分钟），又按 `start_timestamp` 分桶，跨越窗口起点的那条记录会被整条裁掉（长跑进程在「今日」窗口因此显示 **0 秒**）。现改为直读宿主 `online_time` 明细，按每条记录的 `end - start` 与统计区间求交集累加，与宿主 WebUI 算法一致，单窗口模式也能正确算出窗口内的那一段。
+- 取数：`_manifest.json` 移除已不再使用的 `statistics.local.online_time_trend` 能力声明。
+- 文档：删除「在线时长明显偏低、仅供参考」的脚注与 README 说明。
+
+## [1.8.1]
+
+### 细节
+
+- 修复模块归类：宿主聚合表的 `module_name` 只保留首个「.」之前的部分，`maisaka.planner` / `maisaka.replyer`（Maisaka 主聊天链路）被压成 `maisaka` 归入「记忆」、`A_Memorix.ImageEmbedding` 被归入「记忆」而非「图片」，导致「聊天链路 Token」严重低估。现在 Token / 请求次数改用**完整 request_type**（`group_by=type`）归类，带点的前缀（`maisaka.plan` / `maisaka.replyer` / `A_Memorix.ImageEmbedding`）才能命中；会话视图同步改为用完整 `request_type` 分组。
+- 取数：模块花费受宿主能力限制（`model_trend` 只支持 `module_name` 过滤）仍保持 `module_name` 粒度，并在报告脚注明确标注两种粒度不同。
+- 文档：报告脚注与 README 补充口径说明——「总计 = 供应商上报 `total_tokens` 之和，部分供应商把缓存 / 推理 token 也算进 total，因此可能略大于输入 + 输出（宿主 WebUI 的合计用的是输入 + 输出）」；「模块 Token 按 request_type 归类，模块花费按 module_name 归类且只覆盖前 N 个模块」。
+- 配置：模块分组字段的说明文案由「模块名前缀（请求类型首个「.」之前的部分）」更正为「完整请求类型前缀」。
+
 ## [1.8.0]
 
 ### 主要功能
