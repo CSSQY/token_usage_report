@@ -75,9 +75,9 @@ class PluginSection(PluginConfigBase):
         json_schema_extra={"label": "启用插件", "hint": "关闭后 /token、LLM 工具与定时播报全部停止"},
     )
     config_version: str = Field(
-        default="1.8.4",
+        default="1.8.5",
         description="配置结构版本，由插件维护；升级配置结构时递增，用户一般不需要改动",
-        json_schema_extra={"label": "配置版本", "hint": "插件用它判断是否升级配置结构，一般不用改", "placeholder": "1.8.4"},
+        json_schema_extra={"label": "配置版本", "hint": "插件用它判断是否升级配置结构，一般不用改", "placeholder": "1.8.5"},
     )
 
 

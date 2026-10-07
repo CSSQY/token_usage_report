@@ -111,6 +111,33 @@ def _extract_stream_id(payload: Any) -> str:
     return ""
 
 
+def _extract_send_outcome(payload: Any) -> Tuple[bool, str]:
+    """解析宿主发送能力的返回值，返回 ``(是否成功, 失败原因)``。
+
+    宿主的 ``send.*`` 能力在发送失败时**不抛异常**，而是返回 ``{"success": False, "error": ...}``
+    （见宿主 ``_build_send_result``），外层再由能力服务包一层 ``success=True`` 的传输信封。
+    SDK 交给插件的是内层结果，因此必须读 ``success`` 字段：``bool(payload)`` 对失败字典
+    同样为 True，会把发送失败误判成成功，导致播报静默丢消息而日志显示一切正常。
+
+    返回结构不符合预期时直接报错，不用兜底把契约变化掩盖成「发送成功」。
+
+    Args:
+        payload: 宿主发送能力的返回值。
+
+    Returns:
+        Tuple[bool, str]: 是否发送成功，以及失败原因（成功时为空串）。
+
+    Raises:
+        ValueError: 返回值不是带 ``success`` 字段的字典时抛出。
+    """
+
+    if not isinstance(payload, dict) or "success" not in payload:
+        raise ValueError(f"宿主发送能力返回结构异常：{type(payload).__name__}")
+    if payload.get("success"):
+        return True, ""
+    return False, str(payload.get("error") or "宿主未给出失败原因")
+
+
 async def send_report(
     ctx: Any,
     stream_id: str,
@@ -135,19 +162,21 @@ async def send_report(
     sent_any = False
     if image_base64:
         try:
-            sent_image = await ctx.send.image(image_base64, stream_id)
-            sent_any = sent_any or bool(sent_image)
-            if not sent_image:
-                logger.warning("[token_usage_report] 图片发送失败：stream_id=%s", stream_id)
+            sent_image, image_error = _extract_send_outcome(await ctx.send.image(image_base64, stream_id))
+            if sent_image:
+                sent_any = True
+            else:
+                logger.warning("[token_usage_report] 图片发送失败：stream_id=%s，%s", stream_id, image_error)
         except Exception as exc:
             logger.warning("[token_usage_report] 图片发送异常：stream_id=%s，%s", stream_id, exc)
 
     if text:
         try:
-            sent_text = await ctx.send.text(text, stream_id)
-            sent_any = sent_any or bool(sent_text)
-            if not sent_text:
-                logger.warning("[token_usage_report] 文本发送失败：stream_id=%s", stream_id)
+            sent_text, text_error = _extract_send_outcome(await ctx.send.text(text, stream_id))
+            if sent_text:
+                sent_any = True
+            else:
+                logger.warning("[token_usage_report] 文本发送失败：stream_id=%s，%s", stream_id, text_error)
         except Exception as exc:
             logger.warning("[token_usage_report] 文本发送异常：stream_id=%s，%s", stream_id, exc)
     return sent_any
