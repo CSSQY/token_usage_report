@@ -639,7 +639,13 @@ def render_trend_chart(
         f"x2=\"{width - padding_left}\" y2=\"{baseline}\" "
         f"stroke=\"{theme['border']}\" stroke-width=\"1\"/>"
     )
-    label_step = max(1, len(labels) // 12)
+    # 横轴标签都是时间戳（如 "10-08 20:00"），按最长标签的估算宽度决定最多画几个：
+    # 原先用 len(labels)//12 取步长，len 在 12~23 时整除恒为 1，15~23 个小时标签会全部画出，
+    # 间距仅约 40px 而标签本身约 55px 宽，必然重叠。
+    label_font_size = 10
+    longest_label_width = max((len(label) for label in labels), default=1) * label_font_size * 0.55
+    max_visible_labels = max(1, int(plot_width // (longest_label_width + 10)))
+    label_step = max(1, math.ceil(len(labels) / max_visible_labels))
     if draw_bars:
         for index, label in enumerate(labels):
             group_x = padding_left + index * group_width
@@ -660,7 +666,8 @@ def render_trend_chart(
         if index % label_step != 0:
             continue
         parts.append(
-            f"<text x=\"{padding_left + index * group_width + group_width / 2:.1f}\" y=\"{height - 8}\" font-size=\"10\" "
+            f"<text x=\"{padding_left + index * group_width + group_width / 2:.1f}\" y=\"{height - 8}\" "
+            f"font-size=\"{label_font_size}\" "
             f"fill=\"{theme['muted']}\" text-anchor=\"middle\">{_escape(label)}</text>"
         )
     if draw_lines:

@@ -6,6 +6,7 @@ import logging
 import re
 
 from .config_model import TokenUsageReportConfig
+from .llm_client import LlmCallError, generate_rewrite
 from .metrics import (
     WINDOW_ORDER,
     ReportMetrics,
@@ -359,12 +360,12 @@ def render_text_report(metrics: ReportMetrics, config: TokenUsageReportConfig) -
 
     placeholders = build_placeholders(metrics, config)
     suppressed = collect_suppressed_keys(metrics)
-    template = _drop_fully_suppressed_lines(config.report.template, suppressed)
+    template = _drop_fully_suppressed_lines(config.text_template.template, suppressed)
     try:
         rendered = _tidy_text(template.format_map(_SafeFormatDict(placeholders)))
     except Exception as exc:
         logger.error("[token_usage_report] 文本模板渲染失败，已回退默认模板: %s", exc)
-        default_template = type(config.report).model_fields["template"].default
+        default_template = type(config.text_template).model_fields["template"].default
         fallback_template = _drop_fully_suppressed_lines(str(default_template), suppressed)
         rendered = _tidy_text(fallback_template.format_map(_SafeFormatDict(placeholders)))
     return _append_window_scope_notice(rendered, metrics)
@@ -401,9 +402,9 @@ async def read_persona_prompt(ctx: Any, config: TokenUsageReportConfig) -> str:
 
     读取的是宿主全局配置（``config.get``）：``bot.nickname``、
     ``personality.personality``、``personality.reply_style``。
-    若配置了 ``report.persona_template``，则用它渲染，支持占位符
+    若配置了 ``llm_rewrite.persona_template``，则用它渲染，支持占位符
     ``{bot_name}`` / ``{personality}`` / ``{reply_style}``；留空时使用内置拼装。
-    ``report.persona_extra`` 会追加在最末尾。
+    ``llm_rewrite.persona_extra`` 会追加在最末尾。
 
     Args:
         ctx: 插件运行时上下文。
@@ -413,8 +414,8 @@ async def read_persona_prompt(ctx: Any, config: TokenUsageReportConfig) -> str:
         str: 人格提示词前缀；未启用或全部为空时返回空串。
     """
 
-    persona_extra = str(config.report.persona_extra or "").strip()
-    if not config.report.use_persona:
+    persona_extra = str(config.llm_rewrite.persona_extra or "").strip()
+    if not config.llm_rewrite.use_persona:
         return f"{persona_extra}\n" if persona_extra else ""
 
     persona_values = {"bot_name": "", "personality": "", "reply_style": ""}
@@ -431,7 +432,7 @@ async def read_persona_prompt(ctx: Any, config: TokenUsageReportConfig) -> str:
             continue
         persona_values[value_key] = str(value or "").strip()
 
-    template = str(config.report.persona_template or "").strip()
+    template = str(config.llm_rewrite.persona_template or "").strip()
     if template:
         try:
             persona_text = template.format_map(_SafeFormatDict(persona_values)).strip()
@@ -490,10 +491,11 @@ async def render_llm_report(
     metrics: ReportMetrics,
     config: TokenUsageReportConfig,
 ) -> str:
-    """调用宿主模型组对统计结果做风格化转述；失败时回退为模板文本。
+    """对统计结果做 LLM 风格化转述；失败时回退为模板文本。
 
-    提示词结构：``宿主人格`` + ``report.llm_prompt`` + ``统计数据``。
+    提示词结构：``宿主人格`` + ``llm_rewrite.llm_prompt`` + ``统计数据``。
     转述提示词里可以用 ``{unit_name}`` 引用当前配置的用量单位名。
+    模型来源由 ``llm_rewrite.provider`` 决定（宿主模型组 / 自定义兼容服务）。
 
     Args:
         ctx: 插件运行时上下文。
@@ -505,41 +507,13 @@ async def render_llm_report(
     """
 
     persona_prefix = await read_persona_prompt(ctx, config)
-    llm_prompt = _render_llm_prompt(config.report.llm_prompt, metrics.unit_name)
+    llm_prompt = _render_llm_prompt(config.llm_rewrite.llm_prompt, metrics.unit_name)
     prompt = f"{persona_prefix}{llm_prompt}\n\n{build_data_block(metrics, config)}"
     try:
-        result = await ctx.llm.generate(prompt=prompt, task_name=config.report.llm_task_name)
-    except Exception as exc:
-        logger.error("[token_usage_report] LLM 转述调用失败，已回退模板文本: %s", exc)
+        return await generate_rewrite(ctx, config, prompt)
+    except LlmCallError as exc:
+        logger.error("[token_usage_report] LLM 转述调用失败，已回退模板文本：%s", exc)
         return render_text_report(metrics, config)
-
-    response: Optional[str] = None
-    if isinstance(result, dict):
-        if result.get("success") and result.get("response"):
-            response = str(result["response"]).strip()
-        elif not result.get("success"):
-            logger.error("[token_usage_report] LLM 转述返回失败，已回退模板文本: %s", result.get("error"))
-    if not response:
-        logger.error("[token_usage_report] LLM 转述未返回有效文本，已回退模板文本")
-        return render_text_report(metrics, config)
-    return response
-
-
-async def build_report_text(ctx: Any, metrics: ReportMetrics, config: TokenUsageReportConfig) -> str:
-    """按配置选择模板或 LLM 转述，生成最终文本报告。
-
-    Args:
-        ctx: 插件运行时上下文。
-        metrics: 指标快照。
-        config: 插件配置。
-
-    Returns:
-        str: 最终文本报告。
-    """
-
-    if config.report.mode == "llm":
-        return await render_llm_report(ctx, metrics, config)
-    return render_text_report(metrics, config)
 
 
 def build_short_window_text(metrics: ReportMetrics, window_key: str) -> str:

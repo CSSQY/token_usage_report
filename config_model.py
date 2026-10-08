@@ -75,9 +75,9 @@ class PluginSection(PluginConfigBase):
         json_schema_extra={"label": "启用插件", "hint": "关闭后 /token、LLM 工具与定时播报全部停止"},
     )
     config_version: str = Field(
-        default="1.8.5",
+        default="1.10.0",
         description="配置结构版本，由插件维护；升级配置结构时递增，用户一般不需要改动",
-        json_schema_extra={"label": "配置版本", "hint": "插件用它判断是否升级配置结构，一般不用改", "placeholder": "1.8.5"},
+        json_schema_extra={"label": "配置版本", "hint": "插件用它判断是否升级配置结构，一般不用改", "placeholder": "1.10.0"},
     )
 
 
@@ -133,59 +133,16 @@ class ModelAliasSection(PluginConfigBase):
     )
 
 
-class ReportSection(PluginConfigBase):
-    """每日定时播报与 LLM 风格化转述配置。"""
+class TextTemplateSection(PluginConfigBase):
+    """模板文本报告配置：只负责「按模板文本发送」时的排版。"""
 
-    __ui_label__ = "定时播报"
-    __ui_icon__ = "clock"
+    __ui_label__ = "模板文本"
+    __ui_icon__ = "file-text"
     __ui_order__ = 3
 
-    enabled: bool = Field(
-        default=False,
-        description="开启后按「发送时刻」定时推送报告；默认关闭，避免在没有配置目标群时就向聊天发消息",
-        json_schema_extra={"label": "启用定时播报", "hint": "默认关闭；开启前请先填好目标群号或目标 QQ 号"},
-    )
-    schedule_times: List[str] = Field(
-        default=["08:00", "20:00"],
-        description="每日发送时刻，24 小时制 HH:MM，可填多个；已经过去的时刻不会补发",
-        json_schema_extra={
-            **_list_field("08:00", "在输入框填 HH:MM 后点 + 添加，可加多条；已过去的时刻不补发"),
-            "label": "发送时刻",
-        },
-    )
-    platform: str = Field(
-        default="qq",
-        description="目标平台标识，用于把群号/QQ 号解析成聊天流；一般保持 qq 即可",
-        json_schema_extra={"label": "平台", "hint": "用于把群号/QQ 号解析成聊天流，通常保持 qq", "placeholder": "qq"},
-    )
-    target_groups: List[str] = Field(
-        default_factory=list,
-        description="接收播报的 QQ 群号；群号不存在时会尝试创建聊天流，仍失败则跳过并在日志提示",
-        json_schema_extra={
-            **_list_field("123456789", "填群号后点 + 添加，可加多个群；群不存在会尝试建会话，失败则跳过"),
-            "label": "目标群号",
-        },
-    )
-    target_users: List[str] = Field(
-        default_factory=list,
-        description="接收播报的 QQ 号（私聊）；与目标群号可以同时配置",
-        json_schema_extra={
-            **_list_field("10001", "填 QQ 号后点 + 添加，可加多个；与目标群号可以同时配置"),
-            "label": "目标 QQ 号",
-        },
-    )
-    mode: Literal["template", "llm"] = Field(
-        default="template",
-        description="报告的文本呈现方式：模板渲染 或 复用宿主模型组做风格化转述",
-        json_schema_extra={
-            "label": "呈现方式",
-            "hint": "选「文本模板」=固定格式、结果稳定；选「LLM 风格化转述」=用宿主模型组改写成自然语言（可带人格）",
-        },
-    )
     template: str = Field(
         default=_DEFAULT_TEMPLATE,
-        description="文本模板，仅在呈现方式为「文本模板」时使用。"
-        "占位符随取随用：下面列出的 54 个不要求全部使用，想显示哪个就写哪个，"
+        description="文本模板。占位符随取随用：下面列出的 54 个不要求全部使用，想显示哪个就写哪个，"
         "没写的不会出现在报告里（只用了部分占位符时，空出来的行会被自动压掉）。"
         "可用占位符（共 54 个）——"
         "基础：{date} 报告时间、{unit_name} 单位名、{scope} 范围标识、{scope_name} 范围中文、{total_scope} 总计口径；"
@@ -206,20 +163,127 @@ class ReportSection(PluginConfigBase):
         "写错的占位符会被置空并记录一条警告，模板语法错误会回退内置默认模板。",
         json_schema_extra={
             "label": "文本模板",
-            "hint": "占位符随取随用：写哪个就显示哪个，没写的不会出现，空出来的行会自动压掉；把鼠标移到字段名上可看全部 54 个占位符清单",
+            "hint": "占位符随取随用：写哪个就显示哪个，没写的不会出现，空出来的行会自动压掉；"
+            "把鼠标移到字段名上可看全部 54 个占位符清单。仅当发送方式选「模板文本」时生效",
             "x-widget": "textarea",
             "rows": 14,
             "placeholder": "📊 {unit_name} 消耗统计（{date}）…",
         },
     )
+
+
+class LlmRewriteSection(PluginConfigBase):
+    """LLM 风格化转述配置：提示词、人格注入与模型来源（宿主模型组 / 自定义服务）。"""
+
+    __ui_label__ = "LLM 风格化转述"
+    __ui_icon__ = "sparkles"
+    __ui_order__ = 4
+
+    provider: Literal["host", "custom"] = Field(
+        default="host",
+        description="模型来源：host=复用宿主已配置好的模型组；custom=调用下面填写的 OpenAI Chat Completions 兼容服务",
+        json_schema_extra={
+            "label": "模型来源",
+            "hint": "host=用宿主模型组（模型与温度由宿主维护）；custom=用下面填写的自定义兼容服务，需要填地址与模型名",
+        },
+    )
     llm_task_name: str = Field(
         default="utils",
-        description="复用的宿主模型组（model_config.toml 里的任务配置名，如 utils / replyer / planner）；"
+        description="模型来源为 host 时复用的宿主模型组（model_config.toml 里的任务配置名，如 utils / replyer / planner）；"
         "模型与温度等参数都在宿主侧维护，填了不存在的名字时由宿主按默认策略解析",
         json_schema_extra={
-            "label": "模型组（任务配置名）",
-            "hint": "填宿主已分配好的模型组名，例如 utils / replyer / planner；模型与温度都由宿主那侧决定",
+            "label": "宿主模型组（任务配置名）",
+            "hint": "仅「模型来源=host」时生效：填宿主已分配好的模型组名，例如 utils / replyer / planner",
             "placeholder": "utils",
+        },
+    )
+    api_base_url: str = Field(
+        default="",
+        description="自定义服务的接口基地址（OpenAI Chat Completions 兼容），"
+        "插件会向「基地址 + /chat/completions」发 POST 请求；例如 https://api.example.com/v1",
+        json_schema_extra={
+            "label": "接口地址",
+            "hint": "仅「模型来源=custom」时生效：填到 /v1 为止即可，插件自动补 /chat/completions；例如 https://api.example.com/v1",
+            "placeholder": "https://api.example.com/v1",
+        },
+    )
+    api_key: str = Field(
+        default="",
+        description="自定义服务的 API Key，会以 Authorization: Bearer <key> 发送；留空则不发送该请求头（适用于本地免鉴权服务）",
+        json_schema_extra={
+            "label": "API Key",
+            "hint": "仅「模型来源=custom」时生效：留空则不带 Authorization 头（适合本地免鉴权服务）",
+            "x-widget": "password",
+            "placeholder": "sk-…",
+        },
+    )
+    model: str = Field(
+        default="",
+        description="自定义服务使用的模型名（会作为请求体里的 model 字段）",
+        json_schema_extra={
+            "label": "模型名",
+            "hint": "仅「模型来源=custom」时生效：填服务方要求的模型 ID，例如 gpt-4o-mini / deepseek-chat",
+            "placeholder": "deepseek-chat",
+        },
+    )
+    temperature: float = Field(
+        default=0.7,
+        ge=0.0,
+        le=2.0,
+        description="采样温度（0~2），仅自定义服务生效；越低越稳定、越高越发散",
+        json_schema_extra={
+            "label": "温度",
+            "hint": "仅「模型来源=custom」时生效：越低越稳定、越高越发散",
+            "x-widget": "slider",
+            "step": 0.1,
+        },
+    )
+    extra_body: str = Field(
+        default="",
+        description="额外的请求体参数（JSON 对象文本），会与默认参数合并（同名时以这里为准）；"
+        '例如 {"top_p": 0.9, "frequency_penalty": 0.2}；留空表示不加',
+        json_schema_extra={
+            "label": "额外请求参数",
+            "hint": '仅「模型来源=custom」时生效：填 JSON 对象文本，例如 {"top_p": 0.9}；同名参数会覆盖默认值，格式错误会记一条 warning 并忽略',
+            "x-widget": "textarea",
+            "rows": 3,
+            "placeholder": '{"top_p": 0.9}',
+        },
+    )
+    max_retries: int = Field(
+        default=2,
+        ge=0,
+        le=10,
+        description="自定义服务调用失败后的重试次数（0 表示不重试，最多重试 10 次）",
+        json_schema_extra={
+            "label": "重试次数",
+            "hint": "仅「模型来源=custom」时生效：0=不重试；网络错误与 5xx / 429 会重试，其余 4xx 直接失败不重试",
+            "placeholder": "2",
+            "step": 1,
+        },
+    )
+    timeout_seconds: float = Field(
+        default=60.0,
+        ge=1.0,
+        le=600.0,
+        description="单次自定义服务请求的超时时间（秒）",
+        json_schema_extra={
+            "label": "超时时间（秒）",
+            "hint": "仅「模型来源=custom」时生效：单次请求最长等待时间",
+            "placeholder": "60",
+            "step": 5,
+        },
+    )
+    retry_interval_seconds: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=60.0,
+        description="两次重试之间的等待时间（秒）",
+        json_schema_extra={
+            "label": "重试间隔（秒）",
+            "hint": "仅「模型来源=custom」时生效：两次重试之间等待多久",
+            "placeholder": "1",
+            "step": 0.5,
         },
     )
     use_persona: bool = Field(
@@ -262,66 +326,74 @@ class ReportSection(PluginConfigBase):
             "placeholder": "请用自然、口语化的中文把数据转述给群友…",
         },
     )
-    send_image: bool = Field(
-        default=True,
-        description="播报时是否附带图片报告；图片渲染失败会自动改为只发文字并记录一条错误日志",
-        json_schema_extra={"label": "附带图片", "hint": "图片渲染失败时会自动改为只发文字，并记一条错误日志"},
+
+
+class ReportSection(PluginConfigBase):
+    """每日定时播报配置：调度时刻与目标。"""
+
+    __ui_label__ = "定时播报"
+    __ui_icon__ = "clock"
+    __ui_order__ = 5
+
+    enabled: bool = Field(
+        default=False,
+        description="开启后按「发送时刻」定时推送报告；默认关闭，避免在没有配置目标群时就向聊天发消息",
+        json_schema_extra={"label": "启用定时播报", "hint": "默认关闭；开启前请先填好目标群号或目标 QQ 号"},
+    )
+    schedule_times: List[str] = Field(
+        default=["08:00", "20:00"],
+        description="每日发送时刻，24 小时制 HH:MM，可填多个；已经过去的时刻不会补发",
+        json_schema_extra={
+            **_list_field("08:00", "在输入框填 HH:MM 后点 + 添加，可加多条；已过去的时刻不补发"),
+            "label": "发送时刻",
+        },
+    )
+    platform: str = Field(
+        default="qq",
+        description="目标平台标识，用于把群号/QQ 号解析成聊天流；一般保持 qq 即可",
+        json_schema_extra={"label": "平台", "hint": "用于把群号/QQ 号解析成聊天流，通常保持 qq", "placeholder": "qq"},
+    )
+    target_groups: List[str] = Field(
+        default_factory=list,
+        description="接收播报的 QQ 群号；群号不存在时会尝试创建聊天流，仍失败则跳过并在日志提示",
+        json_schema_extra={
+            **_list_field("123456789", "填群号后点 + 添加，可加多个群；群不存在会尝试建会话，失败则跳过"),
+            "label": "目标群号",
+        },
+    )
+    target_users: List[str] = Field(
+        default_factory=list,
+        description="接收播报的 QQ 号（私聊）；与目标群号可以同时配置",
+        json_schema_extra={
+            **_list_field("10001", "填 QQ 号后点 + 添加，可加多个；与目标群号可以同时配置"),
+            "label": "目标 QQ 号",
+        },
+    )
+    send_mode: Literal["template", "llm", "image"] = Field(
+        default="image",
+        description="定时播报的发送方式：template=按模板文本发送，llm=发 LLM 风格化转述，image=发图片报告"
+        "（图片渲染失败会自动回退为模板文本并记录一条错误日志）",
+        json_schema_extra={
+            "label": "发送方式",
+            "hint": "模板文本=固定格式、结果稳定（见「模板文本」分节）；LLM 转述=改写成自然语言（见「LLM 风格化转述」分节）；"
+            "图片=发渲染好的图片报告，渲染失败自动回退模板文本",
+        },
     )
 
 
+
+
 class CommandSection(PluginConfigBase):
-    """``/token`` 指令配置。"""
+    """``/token`` 指令的行为开关（权限见「指令查询权限」分节）。"""
 
     __ui_label__ = "统计指令"
     __ui_icon__ = "terminal"
-    __ui_order__ = 4
+    __ui_order__ = 6
 
     enabled: bool = Field(
         default=True,
         description="关闭后 /token 与 /tokens 不再响应（机器人的其他功能不受影响）",
         json_schema_extra={"label": "启用指令", "hint": "关闭后 /token 与 /tokens 不再响应，其他功能不受影响"},
-    )
-    permission_mode: Literal["all", "whitelist", "blacklist"] = Field(
-        default="whitelist",
-        description="群名单制度：默认「群白名单」（只有白名单内的群可用，避免群里任何人一句话就把全局账本翻出来）；"
-        "确认要开放给所有群时再改成「不限制」",
-        json_schema_extra={
-            "label": "群名单制度",
-            "hint": "默认「群白名单」：先把允许用指令的群号填到下面的白名单里；选「不限制」=任何群都能用（群黑名单仍生效）；"
-            "选「群黑名单」=黑名单里的群不可用。用户名单三种制度下都生效，且冲突时黑名单优先",
-        },
-    )
-    whitelist_groups: List[str] = Field(
-        default_factory=list,
-        description="群白名单：仅在「群白名单」制度下生效；与群黑名单冲突时黑名单优先",
-        json_schema_extra={
-            **_list_field("123456789", "填群号后点 + 添加；仅在「群白名单」制度下生效"),
-            "label": "白名单群号",
-        },
-    )
-    whitelist_users: List[str] = Field(
-        default_factory=list,
-        description="用户白名单：命中的 QQ 号始终可用（优先于群名单）；与用户黑名单冲突时黑名单优先",
-        json_schema_extra={
-            **_list_field("10001", "填 QQ 号后点 + 添加；命中的用户始终可用（优先于群名单）"),
-            "label": "白名单 QQ 号",
-        },
-    )
-    blacklist_groups: List[str] = Field(
-        default_factory=list,
-        description="群黑名单：命中的群在任何制度下都不可用（优先于群白名单）",
-        json_schema_extra={
-            **_list_field("123456789", "填群号后点 + 添加；命中的群在任何制度下都不可用"),
-            "label": "黑名单群号",
-        },
-    )
-    blacklist_users: List[str] = Field(
-        default_factory=list,
-        description="用户黑名单：命中的 QQ 号始终不可用（最高优先级，高于用户白名单）",
-        json_schema_extra={
-            **_list_field("10001", "填 QQ 号后点 + 添加；命中的用户始终不可用（优先级最高）"),
-            "label": "黑名单 QQ 号",
-        },
     )
     notify_no_permission: bool = Field(
         default=True,
@@ -340,23 +412,261 @@ class CommandSection(PluginConfigBase):
             "placeholder": "你没有权限使用该指令",
         },
     )
-    tool_allowed_scopes: List[str] = Field(
-        default_factory=lambda: ["current"],
-        description="LLM 工具 query_token_usage 允许查询的范围（默认只允许当前对话）；"
-        "填 current / all / group / user，留空表示禁止通过工具查询",
+    send_mode: Literal["template", "llm", "image"] = Field(
+        default="image",
+        description="指令回复的发送方式：template=按模板文本发送，llm=发 LLM 风格化转述，image=发图片报告"
+        "（图片渲染失败会自动回退为模板文本并记录一条错误日志）",
         json_schema_extra={
-            **_list_field(
-                "current",
-                "填 current=当前对话（默认）/ all=全部会话 / group=指定群 / user=指定用户，填完点 + 添加；"
-                "留空=模型完全不能查（工具存在但一律拒绝）",
-            ),
-            "label": "工具可查询范围",
+            "label": "发送方式",
+            "hint": "模板文本=固定格式、结果稳定（见「模板文本」分节）；LLM 转述=改写成自然语言（见「LLM 风格化转述」分节）；"
+            "图片=发渲染好的图片报告，渲染失败自动回退模板文本",
         },
     )
-    use_image: bool = Field(
+
+
+class ToolPermissionSection(PluginConfigBase):
+    """第一组权限：LLM 工具 ``query_token_usage`` 的查询权限。
+
+    与「指令查询权限」完全独立：这里改的是模型通过工具查数据的权限，
+    不影响 ``/token`` 指令，反之亦然。
+    """
+
+    __ui_label__ = "LLM 工具查询权限"
+    __ui_icon__ = "shield"
+    __ui_order__ = 7
+
+    permission_mode: Literal["whitelist", "blacklist"] = Field(
+        default="whitelist",
+        description="对话流名单制度：whitelist=名单外一律不可用；blacklist=名单外一律可用",
+        json_schema_extra={
+            "label": "名单制度",
+            "hint": "白名单（默认）=只有名单内的对话可用；黑名单=只有名单内的对话不可用（想全放开就用黑名单+留空）",
+        },
+    )
+    whitelist_groups: List[str] = Field(
+        default_factory=list,
+        description="白名单制度下允许模型查询的群号；与群黑名单冲突时黑名单优先",
+        json_schema_extra={
+            **_list_field("123456789", "填群号后点 + 添加；仅在「白名单」制度下生效"),
+            "label": "白名单群号",
+        },
+    )
+    whitelist_users: List[str] = Field(
+        default_factory=list,
+        description="命中的 QQ 号始终可用（只绕开对话流名单，范围/窗口仍受下面放行列表约束）",
+        json_schema_extra={
+            **_list_field("10001", "填 QQ 号后点 + 添加；命中的用户始终可用，但仍受范围/窗口限制"),
+            "label": "白名单 QQ 号",
+        },
+    )
+    blacklist_groups: List[str] = Field(
+        default_factory=list,
+        description="命中的群在任何制度下都不可用（优先于群白名单）",
+        json_schema_extra={
+            **_list_field("123456789", "填群号后点 + 添加；命中的群在任何制度下都不可用"),
+            "label": "黑名单群号",
+        },
+    )
+    blacklist_users: List[str] = Field(
+        default_factory=list,
+        description="命中的 QQ 号始终不可用（最高优先级，高于用户白名单）",
+        json_schema_extra={
+            **_list_field("10001", "填 QQ 号后点 + 添加；命中的用户始终不可用（优先级最高）"),
+            "label": "黑名单 QQ 号",
+        },
+    )
+    allow_scope_current: bool = Field(
         default=True,
-        description="指令回复是否使用图片渲染；渲染失败会自动改为只发文字并记录一条错误日志",
-        json_schema_extra={"label": "指令使用图片", "hint": "渲染失败会自动改为只发文字，并记一条错误日志"},
+        description="全局默认可查询范围：当前对话（不填「每对话范围覆盖」时生效）",
+        json_schema_extra={"label": "放行范围：当前对话", "hint": "默认放行；关掉后模型不能查它所在的这个对话"},
+    )
+    allow_scope_all: bool = Field(
+        default=False,
+        description="全局默认可查询范围：全部会话（不填「每对话范围覆盖」时生效）",
+        json_schema_extra={"label": "放行范围：全部会话", "hint": "默认不放行；开启后模型可查全站用量"},
+    )
+    allow_scope_group: bool = Field(
+        default=False,
+        description="全局默认可查询范围：指定群聊（不填「每对话范围覆盖」时生效）",
+        json_schema_extra={"label": "放行范围：指定群聊", "hint": "默认不放行；开启后模型可查别的群的用量"},
+    )
+    allow_scope_user: bool = Field(
+        default=False,
+        description="全局默认可查询范围：指定用户（不填「每对话范围覆盖」时生效）",
+        json_schema_extra={"label": "放行范围：指定用户", "hint": "默认不放行；开启后模型可查指定用户的用量"},
+    )
+    allow_window_all: bool = Field(
+        default=True,
+        description="全局默认可查询窗口：全部窗口（不指定时间口径的查询）",
+        json_schema_extra={"label": "放行窗口：全部窗口", "hint": "默认放行；关掉后模型必须指定一个具体时间窗口"},
+    )
+    allow_window_today: bool = Field(
+        default=True,
+        description="全局默认可查询窗口：今日",
+        json_schema_extra={"label": "放行窗口：今日", "hint": "默认放行"},
+    )
+    allow_window_this_week: bool = Field(
+        default=True,
+        description="全局默认可查询窗口：本周",
+        json_schema_extra={"label": "放行窗口：本周", "hint": "默认放行"},
+    )
+    allow_window_this_month: bool = Field(
+        default=True,
+        description="全局默认可查询窗口：本月",
+        json_schema_extra={"label": "放行窗口：本月", "hint": "默认放行"},
+    )
+    allow_window_last_24h: bool = Field(
+        default=True,
+        description="全局默认可查询窗口：最近 24 小时",
+        json_schema_extra={"label": "放行窗口：最近24小时", "hint": "默认放行"},
+    )
+    allow_window_last_7d: bool = Field(
+        default=True,
+        description="全局默认可查询窗口：最近 7×24 小时",
+        json_schema_extra={"label": "放行窗口：最近7天", "hint": "默认放行"},
+    )
+    allow_window_last_30d: bool = Field(
+        default=True,
+        description="全局默认可查询窗口：最近 30×24 小时",
+        json_schema_extra={"label": "放行窗口：最近30天", "hint": "默认放行"},
+    )
+    scope_overrides: List[str] = Field(
+        default_factory=list,
+        description="针对单个对话流覆盖上面的放行范围与窗口，格式「聊天流类型|号码|可查询范围|可查询窗口」，"
+        "例如「群聊|123456|当前对话,全部会话|今日,本周」；留空则该对话用上面的全局默认。"
+        "范围可填 当前对话/全部会话/指定群聊/指定用户，窗口可填 全部窗口/今日/本周/本月/最近24小时/最近7天/最近30天，"
+        "两段写 * 表示全部放行、留空表示全部禁止",
+        json_schema_extra={
+            **_list_field(
+                "群聊|123456|当前对话,全部会话|今日,本周",
+                "格式：聊天流类型|号码|可查询范围|可查询窗口（如「群聊|123456|当前对话,全部会话|今日,本周」、"
+                "「私聊|10001|*|*」）；类型填 群聊/私聊，号码填群号或账号；留空=用上面的全局默认",
+            ),
+            "label": "每对话范围覆盖",
+        },
+    )
+
+
+class CommandPermissionSection(PluginConfigBase):
+    """第二组权限：``/token`` 指令的查询权限。
+
+    与「LLM 工具查询权限」完全独立：这里改的是人在群里敲 ``/token`` 的权限，
+    不影响模型通过工具查数据，反之亦然。
+    """
+
+    __ui_label__ = "/token 指令查询权限"
+    __ui_icon__ = "shield-check"
+    __ui_order__ = 8
+
+    permission_mode: Literal["whitelist", "blacklist"] = Field(
+        default="whitelist",
+        description="对话流名单制度：whitelist=名单外一律不可用；blacklist=名单外一律可用",
+        json_schema_extra={
+            "label": "名单制度",
+            "hint": "白名单（默认）=只有名单内的对话可用；黑名单=只有名单内的对话不可用（想全放开就用黑名单+留空）",
+        },
+    )
+    whitelist_groups: List[str] = Field(
+        default_factory=list,
+        description="白名单制度下允许使用 /token 的群号；与群黑名单冲突时黑名单优先",
+        json_schema_extra={
+            **_list_field("123456789", "填群号后点 + 添加；仅在「白名单」制度下生效"),
+            "label": "白名单群号",
+        },
+    )
+    whitelist_users: List[str] = Field(
+        default_factory=list,
+        description="命中的 QQ 号始终可用（只绕开对话流名单，范围/窗口仍受下面放行列表约束）",
+        json_schema_extra={
+            **_list_field("10001", "填 QQ 号后点 + 添加；命中的用户始终可用，但仍受范围/窗口限制"),
+            "label": "白名单 QQ 号",
+        },
+    )
+    blacklist_groups: List[str] = Field(
+        default_factory=list,
+        description="命中的群在任何制度下都不可用（优先于群白名单）",
+        json_schema_extra={
+            **_list_field("123456789", "填群号后点 + 添加；命中的群在任何制度下都不可用"),
+            "label": "黑名单群号",
+        },
+    )
+    blacklist_users: List[str] = Field(
+        default_factory=list,
+        description="命中的 QQ 号始终不可用（最高优先级，高于用户白名单）",
+        json_schema_extra={
+            **_list_field("10001", "填 QQ 号后点 + 添加；命中的用户始终不可用（优先级最高）"),
+            "label": "黑名单 QQ 号",
+        },
+    )
+    allow_scope_current: bool = Field(
+        default=True,
+        description="全局默认可查询范围：当前对话（不填「每对话范围覆盖」时生效）",
+        json_schema_extra={"label": "放行范围：当前对话", "hint": "默认放行；关掉后 /token 不能查当前对话自己"},
+    )
+    allow_scope_all: bool = Field(
+        default=True,
+        description="全局默认可查询范围：全部会话（不填「每对话范围覆盖」时生效）",
+        json_schema_extra={"label": "放行范围：全部会话", "hint": "默认放行（与历史行为一致）；关掉后 /token all 不可用"},
+    )
+    allow_scope_group: bool = Field(
+        default=True,
+        description="全局默认可查询范围：指定群聊（不填「每对话范围覆盖」时生效）",
+        json_schema_extra={"label": "放行范围：指定群聊", "hint": "默认放行（与历史行为一致）；关掉后不能指定别的群查"},
+    )
+    allow_scope_user: bool = Field(
+        default=True,
+        description="全局默认可查询范围：指定用户（不填「每对话范围覆盖」时生效）",
+        json_schema_extra={"label": "放行范围：指定用户", "hint": "默认放行（与历史行为一致）；关掉后不能指定用户查"},
+    )
+    allow_window_all: bool = Field(
+        default=True,
+        description="全局默认可查询窗口：全部窗口（不指定时间口径的查询）",
+        json_schema_extra={"label": "放行窗口：全部窗口", "hint": "默认放行；关掉后必须带时间参数才能查"},
+    )
+    allow_window_today: bool = Field(
+        default=True,
+        description="全局默认可查询窗口：今日",
+        json_schema_extra={"label": "放行窗口：今日", "hint": "默认放行"},
+    )
+    allow_window_this_week: bool = Field(
+        default=True,
+        description="全局默认可查询窗口：本周",
+        json_schema_extra={"label": "放行窗口：本周", "hint": "默认放行"},
+    )
+    allow_window_this_month: bool = Field(
+        default=True,
+        description="全局默认可查询窗口：本月",
+        json_schema_extra={"label": "放行窗口：本月", "hint": "默认放行"},
+    )
+    allow_window_last_24h: bool = Field(
+        default=True,
+        description="全局默认可查询窗口：最近 24 小时",
+        json_schema_extra={"label": "放行窗口：最近24小时", "hint": "默认放行"},
+    )
+    allow_window_last_7d: bool = Field(
+        default=True,
+        description="全局默认可查询窗口：最近 7×24 小时",
+        json_schema_extra={"label": "放行窗口：最近7天", "hint": "默认放行"},
+    )
+    allow_window_last_30d: bool = Field(
+        default=True,
+        description="全局默认可查询窗口：最近 30×24 小时",
+        json_schema_extra={"label": "放行窗口：最近30天", "hint": "默认放行"},
+    )
+    scope_overrides: List[str] = Field(
+        default_factory=list,
+        description="针对单个对话流覆盖上面的放行范围与窗口，格式「聊天流类型|号码|可查询范围|可查询窗口」，"
+        "例如「群聊|123456|当前对话|今日,本周」；留空则该对话用上面的全局默认。"
+        "范围可填 当前对话/全部会话/指定群聊/指定用户，窗口可填 全部窗口/今日/本周/本月/最近24小时/最近7天/最近30天，"
+        "两段写 * 表示全部放行、留空表示全部禁止",
+        json_schema_extra={
+            **_list_field(
+                "群聊|123456|当前对话|今日,本周",
+                "格式：聊天流类型|号码|可查询范围|可查询窗口（如「群聊|123456|当前对话|今日,本周」、"
+                "「私聊|10001|*|*」）；类型填 群聊/私聊，号码填群号或账号；留空=用上面的全局默认",
+            ),
+            "label": "每对话范围覆盖",
+        },
     )
 
 
@@ -365,7 +675,7 @@ class RenderSection(PluginConfigBase):
 
     __ui_label__ = "图片渲染"
     __ui_icon__ = "image"
-    __ui_order__ = 5
+    __ui_order__ = 9
 
     template_name: str = Field(
         default="simple",
@@ -519,7 +829,7 @@ class ChartSection(PluginConfigBase):
 
     __ui_label__ = "图表"
     __ui_icon__ = "bar-chart"
-    __ui_order__ = 6
+    __ui_order__ = 10
 
     bar_granularity: Literal["hour", "day", "week", "month"] = Field(
         default="day",
@@ -619,7 +929,7 @@ class ModuleGroupSection(PluginConfigBase):
 
     __ui_label__ = "模块分组"
     __ui_icon__ = "layers"
-    __ui_order__ = 7
+    __ui_order__ = 11
 
     planner: List[str] = Field(
         default=["planner", "maisaka.plan", "plan"],
@@ -691,7 +1001,7 @@ class LimitsSection(PluginConfigBase):
 
     __ui_label__ = "读取上限"
     __ui_icon__ = "gauge"
-    __ui_order__ = 8
+    __ui_order__ = 12
 
     max_session_rows: int = Field(
         default=20000,
@@ -738,8 +1048,12 @@ class TokenUsageReportConfig(PluginConfigBase):
     plugin: PluginSection = Field(default_factory=PluginSection)
     token_unit: TokenUnitSection = Field(default_factory=TokenUnitSection)
     model_aliases: ModelAliasSection = Field(default_factory=ModelAliasSection)
+    text_template: TextTemplateSection = Field(default_factory=TextTemplateSection)
+    llm_rewrite: LlmRewriteSection = Field(default_factory=LlmRewriteSection)
     report: ReportSection = Field(default_factory=ReportSection)
     command: CommandSection = Field(default_factory=CommandSection)
+    llm_tool_permission: ToolPermissionSection = Field(default_factory=ToolPermissionSection)
+    command_permission: CommandPermissionSection = Field(default_factory=CommandPermissionSection)
     render: RenderSection = Field(default_factory=RenderSection)
     chart: ChartSection = Field(default_factory=ChartSection)
     module_groups: ModuleGroupSection = Field(default_factory=ModuleGroupSection)

@@ -24,26 +24,21 @@ from .metrics import (
     ReportMetrics,
     normalize_window_key,
 )
+from .permissions import (
+    SCOPE_LABELS,
+    SCOPE_VALUES,
+    check_conversation_access,
+    normalize_scope,
+    resolve_allowed,
+    scope_labels,
+    window_labels,
+)
 from .renderer import build_report_image
 from .session_stats import SessionStatsError, collect_session_metrics
-from .text_report import build_report_text, build_short_window_text, render_text_report
+from .text_report import build_short_window_text, render_llm_report, render_text_report
 
 logger = logging.getLogger(__name__)
 
-_VALID_SCOPES = ("all", "current", "group", "user")
-_SCOPE_ALIASES = {
-    "全": "all",
-    "全部": "all",
-    "全局": "all",
-    "所有": "all",
-    "当前": "current",
-    "本群": "current",
-    "群": "group",
-    "群聊": "group",
-    "用户": "user",
-    "个人": "user",
-    "私聊": "user",
-}
 _USAGE_TEXT = (
     "用法：/token [范围] [时间]\n"
     "范围：留空=当前对话，all=全部会话，群 <群号>，用户 <QQ号>\n"
@@ -149,60 +144,81 @@ class TokenUsageReportPlugin(MaiBotPlugin):
         """查询 Token 用量并返回给 LLM。
 
         权限与范围收口（工具由模型调用、调用者不会看到指令帮助，因此这里必须自己拦）：
-        1. 复用 ``/token`` 的同一套黑白名单（调用上下文里的 group_id / user_id）；
-        2. 只允许查询 ``command.tool_allowed_scopes`` 里列出的范围（默认仅 current），
-           避免模型替任意人把全局账本或别的群的数据取回来。
+        1. 只认「LLM 工具查询权限」这一组配置（与 ``/token`` 的「指令查询权限」互相独立）；
+        2. 先过对话流黑白名单，再过该对话的「范围 / 窗口」放行列表
+           （每对话范围覆盖优先于全局默认开关）。
         """
 
-        normalized_scope = str(scope or "current").strip().lower() or "current"
-        if normalized_scope not in _VALID_SCOPES:
-            return {"success": False, "content": f"不支持的统计范围：{scope}（可选 {'/'.join(_VALID_SCOPES)}）"}
+        tool_permission = self.config.llm_tool_permission
+        normalized_scope = normalize_scope(scope or "current") or ""
+        if normalized_scope not in SCOPE_VALUES:
+            return {"success": False, "content": f"不支持的统计范围：{scope}（可选 {'/'.join(SCOPE_VALUES)}）"}
 
-        if not self._check_command_permission(
-            group_id=str(kwargs.get("group_id") or ""),
-            user_id=str(kwargs.get("user_id") or ""),
+        requested_group = str(kwargs.get("group_id") or "")
+        requested_user = str(kwargs.get("user_id") or "")
+        if not check_conversation_access(
+            tool_permission,
+            group_id=requested_group,
+            user_id=requested_user,
             is_local_operator=False,
         ):
             logger.info(
-                "[token_usage_report] 工具调用被权限拦下：group=%s user=%s scope=%s",
-                kwargs.get("group_id"),
-                kwargs.get("user_id"),
+                "[token_usage_report] 工具调用被对话流名单拦下：group=%s user=%s scope=%s",
+                requested_group,
+                requested_user,
                 normalized_scope,
             )
             return {
                 "success": False,
                 "content": (
                     f"当前会话没有查询 {self.config.token_unit.unit_name} 用量的权限"
-                    "（与 /token 同一套黑白名单）"
+                    "（由配置「LLM 工具查询权限」决定）"
                 ),
             }
 
-        allowed_scopes = _normalize_scope_list(self.config.command.tool_allowed_scopes)
+        allowed_scopes, allowed_windows = resolve_allowed(
+            tool_permission, group_id=requested_group, user_id=requested_user
+        )
         if normalized_scope not in allowed_scopes:
             logger.info(
-                "[token_usage_report] 工具调用超出允许范围：scope=%s，允许=%s",
+                "[token_usage_report] 工具调用超出放行范围：scope=%s，本对话放行=%s",
                 normalized_scope,
-                sorted(allowed_scopes) or "（空，已全部禁止）",
+                scope_labels(sorted(allowed_scopes)),
             )
             return {
                 "success": False,
                 "content": (
-                    f"不允许通过工具查询「{normalized_scope}」范围"
-                    "（可查询范围由插件配置「工具可查询范围」决定；需要全局统计请让管理员使用 /token 指令）"
+                    f"不允许通过工具查询「{SCOPE_LABELS.get(normalized_scope, normalized_scope)}」范围"
+                    "（可查询范围由配置「LLM 工具查询权限」决定；需要全局统计请让管理员使用 /token 指令）"
                 ),
             }
 
-        window_key = str(window or "").strip().lower()
-        if window_key and window_key != "all":
-            matched_window = normalize_window_key(window_key)
+        raw_window = str(window or "").strip().lower()
+        if raw_window in {"", "all"}:
+            requested_window = "all"
+        else:
+            matched_window = normalize_window_key(raw_window)
             if matched_window is None:
                 return {
                     "success": False,
                     "content": f"不支持的时间范围：{window}（可填 {WINDOW_USAGE_HINT}）",
                 }
-            window_key = matched_window
-        elif window_key == "all":
-            window_key = ""
+            requested_window = matched_window
+        if requested_window not in allowed_windows:
+            logger.info(
+                "[token_usage_report] 工具调用超出放行窗口：window=%s，本对话放行=%s",
+                requested_window,
+                window_labels(sorted(allowed_windows)),
+            )
+            return {
+                "success": False,
+                "content": (
+                    f"不允许通过工具查询「{window_labels([requested_window])}」时间范围"
+                    "（可查询窗口由配置「LLM 工具查询权限」决定）"
+                ),
+            }
+
+        window_key = "" if requested_window == "all" else requested_window
 
         try:
             metrics = await self._collect_metrics(
@@ -264,7 +280,9 @@ class TokenUsageReportPlugin(MaiBotPlugin):
         if not self.config.command.enabled:
             return False, "统计指令已禁用", True
 
-        if not self._check_command_permission(
+        command_permission = self.config.command_permission
+        if not check_conversation_access(
+            command_permission,
             group_id=group_id,
             user_id=user_id,
             is_local_operator=bool(is_local_operator),
@@ -276,6 +294,25 @@ class TokenUsageReportPlugin(MaiBotPlugin):
         if error_message:
             await self.ctx.send.text(error_message, stream_id)
             return False, error_message, True
+
+        # 覆盖项按「发起指令的这个对话」取，与查询目标（群号/QQ 号）无关
+        allowed_scopes, allowed_windows = resolve_allowed(
+            command_permission, group_id=group_id, user_id=user_id
+        )
+        requested_scope = normalize_scope(scope) or scope
+        requested_window = window_key or "all"
+        if requested_scope not in allowed_scopes or requested_window not in allowed_windows:
+            logger.info(
+                "[token_usage_report] 指令请求超出放行列表：group=%s user=%s scope=%s（放行 %s）window=%s（放行 %s）",
+                group_id,
+                user_id,
+                requested_scope,
+                scope_labels(sorted(allowed_scopes)),
+                requested_window,
+                window_labels(sorted(allowed_windows)),
+            )
+            await self._notify_no_permission(stream_id)
+            return False, "范围或时间超出权限", True
 
         try:
             metrics = await self._collect_metrics(
@@ -290,40 +327,39 @@ class TokenUsageReportPlugin(MaiBotPlugin):
             await self.ctx.send.text(failure_text, stream_id)
             return False, failure_text, True
 
-        text_report = render_text_report(metrics, self.config)
-        image_base64: Optional[str] = None
-        if self.config.command.use_image:
-            image_base64, render_error = await build_report_image(self.ctx, metrics, self.config)
-            if image_base64 is None:
-                logger.error("[token_usage_report] 指令图片渲染失败，已回退为文字版本：%s", render_error)
-
-        sent = await send_report(
-            self.ctx,
-            stream_id,
-            self._text_for_delivery(text_report, has_image=image_base64 is not None),
-            image_base64,
-        )
+        text_report, image_base64 = await self._build_delivery(metrics, self.config.command.send_mode)
+        sent = await send_report(self.ctx, stream_id, text_report, image_base64)
         if not sent:
             return False, "统计结果发送失败", True
         return True, f"已发送 {self.config.token_unit.unit_name} 统计", True
 
-    def _text_for_delivery(self, text: str, *, has_image: bool) -> str:
-        """决定是否随图片一起发送文字。
+    async def _build_delivery(
+        self, metrics: ReportMetrics, send_mode: str
+    ) -> Tuple[str, Optional[str]]:
+        """按发送方式准备要发出的内容，返回 ``(文本, 图片 base64)``。
 
-        图片渲染成功时，模板文字与图片内容重复，不再发送；LLM 风格化转述的内容
-        与图片不同，仍然照常发送。图片不可用时文字是唯一的载体，必须发送。
+        三种发送方式互斥（由指令 / 定时播报各自的分节配置）：
+        - ``template``：按「模板文本」分节的模板渲染文本；
+        - ``llm``：LLM 风格化转述（失败自动回退模板文本）；
+        - ``image``：图片报告（渲染失败自动回退模板文本）。
 
         Args:
-            text: 待发送的文本。
-            has_image: 本次是否拿到了可发送的图片。
+            metrics: 指标快照。
+            send_mode: 发送方式。
 
         Returns:
-            str: 实际要发送的文本（空串表示只发图片）。
+            Tuple[str, Optional[str]]: 要发送的文本与图片 base64（二者只会有其一非空）。
         """
 
-        if has_image and self.config.report.mode != "llm":
-            return ""
-        return text
+        if send_mode == "image":
+            image_base64, render_error = await build_report_image(self.ctx, metrics, self.config)
+            if image_base64 is not None:
+                return "", image_base64
+            logger.error("[token_usage_report] 图片渲染失败，已回退为模板文本：%s", render_error)
+            return render_text_report(metrics, self.config), None
+        if send_mode == "llm":
+            return await render_llm_report(self.ctx, metrics, self.config), None
+        return render_text_report(metrics, self.config), None
 
     def _parse_command_args(self, kwargs: Dict[str, Any]) -> Tuple[str, str, str, str]:
         """解析指令参数，返回 ``(scope, target_id, window_key, 错误提示)``。
@@ -344,7 +380,7 @@ class TokenUsageReportPlugin(MaiBotPlugin):
                 expect_target = False
                 continue
 
-            normalized_scope = _SCOPE_ALIASES.get(arg.lower(), _SCOPE_ALIASES.get(arg, arg.lower()))
+            normalized_scope = normalize_scope(arg)
             if normalized_scope in {"group", "user"}:
                 if scope in {"group", "user"}:
                     return "", "", "", f"重复指定了范围。{_USAGE_TEXT}"
@@ -400,48 +436,6 @@ class TokenUsageReportPlugin(MaiBotPlugin):
         if not deny_message:
             return
         await self.ctx.send.text(deny_message, stream_id)
-
-    def _check_command_permission(self, *, group_id: str, user_id: str, is_local_operator: bool) -> bool:
-        """按配置判断指令调用者是否有权限。
-
-        判定顺序：
-        1. 本地调试终端（local operator）始终放行；
-        2. 用户黑名单：命中的用户**始终拒绝**（最高优先级，冲突时优先于用户白名单）；
-        3. 用户白名单：命中的用户**始终放行**（优先于群名单）；
-        4. 群黑名单：命中的群在任何模式下都**拒绝**（冲突时优先于群白名单）；
-        5. ``all`` 模式：不启用群白名单，直接放行；
-        6. ``whitelist`` 模式：群聊要求群在白名单内；
-        7. ``blacklist`` 模式：群聊未命中群黑名单即放行（步骤 4 已处理命中情况）。
-
-        说明：私聊没有群可判定，只能依赖用户名单，因此 ``whitelist`` 模式下
-        未列入用户白名单的私聊会被拒绝。
-        """
-
-        if is_local_operator:
-            return True
-
-        command_config = self.config.command
-        normalized_group_id = str(group_id or "").strip()
-        normalized_user_id = str(user_id or "").strip()
-        is_group_chat = bool(normalized_group_id)
-
-        # 用户名单是绝对规则：黑名单优先于白名单
-        if normalized_user_id and normalized_user_id in command_config.blacklist_users:
-            return False
-        if normalized_user_id and normalized_user_id in command_config.whitelist_users:
-            return True
-
-        # 群黑名单优先于群白名单，且不区分名单制度
-        if is_group_chat and normalized_group_id in command_config.blacklist_groups:
-            return False
-
-        if command_config.permission_mode == "all":
-            return True
-        if not is_group_chat:
-            return command_config.permission_mode != "whitelist"
-        if command_config.permission_mode == "whitelist":
-            return normalized_group_id in command_config.whitelist_groups
-        return True
 
     # ──── 定时播报 ────
 
@@ -520,19 +514,8 @@ class TokenUsageReportPlugin(MaiBotPlugin):
             return
 
         metrics = await collect_global_metrics(self.ctx, self.config)
-        text_report = await build_report_text(self.ctx, metrics, self.config)
-        image_base64: Optional[str] = None
-        if self.config.report.send_image:
-            image_base64, render_error = await build_report_image(self.ctx, metrics, self.config)
-            if image_base64 is None:
-                logger.error("[token_usage_report] 播报图片渲染失败，已回退为文字版本：%s", render_error)
-
-        success_count, failure_count = await broadcast_report(
-            self.ctx,
-            self.config,
-            self._text_for_delivery(text_report, has_image=image_base64 is not None),
-            image_base64,
-        )
+        text_report, image_base64 = await self._build_delivery(metrics, self.config.report.send_mode)
+        success_count, failure_count = await broadcast_report(self.ctx, self.config, text_report, image_base64)
         logger.info("[token_usage_report] 定时播报完成：成功 %d 个目标，失败 %d 个目标", success_count, failure_count)
 
     # ──── 共用 ────
@@ -558,31 +541,6 @@ class TokenUsageReportPlugin(MaiBotPlugin):
             platform=self.config.report.platform,
             window_key=window_key,
         )
-
-
-def _normalize_scope_list(raw_scopes: Any) -> set[str]:
-    """把配置里的「工具可查询范围」规范化为范围集合。
-
-    支持填英文范围名，也支持「全 / 全部 / 群 / 用户」等写法；无法识别的条目会被忽略。
-
-    Args:
-        raw_scopes: 配置中的范围条目列表。
-
-    Returns:
-        set[str]: 规范化后的范围集合。
-    """
-
-    normalized: set[str] = set()
-    for raw_item in raw_scopes or []:
-        item = str(raw_item or "").strip()
-        if not item:
-            continue
-        mapped = _SCOPE_ALIASES.get(item.lower(), _SCOPE_ALIASES.get(item, item.lower()))
-        if mapped in _VALID_SCOPES:
-            normalized.add(mapped)
-            continue
-        logger.warning("[token_usage_report] 「工具可查询范围」里的条目无法识别，已忽略：%s", item)
-    return normalized
 
 
 def _parse_schedule_time(raw_value: object) -> Optional[datetime_time]:

@@ -2,6 +2,49 @@
 
 本文件记录 `cssqy.token-usage-report` 的版本变更。每版分为**主要功能**（用户可感知的新能力）与**细节**（修复、行为调整、插件 SDK / API 适配）两部分，一条一行。
 
+## [1.10.0]
+
+### 主要功能
+
+- **配置拆分**：把原先混在 `[report]` 里的「文本呈现」拆成两个独立分节 —— `[text_template]`（模板文本，只放 `template`）与 `[llm_rewrite]`（LLM 风格化转述：提示词、人格注入、模型来源）。改一个不影响另一个。
+- **发送方式统一**：`[command]` 与 `[report]` 各新增 `send_mode`（三选一）—— `template` 按模板文本发送、`llm` 发 LLM 风格化转述、`image` 发图片报告；两者共用同一个发送实现，图片渲染失败或 LLM 调用失败都会自动回退为模板文本并记一条 error 日志。
+- **自定义 LLM 服务**：`[llm_rewrite].provider` 可选 `host`（复用宿主模型组）或 `custom`（任意 [OI] Chat Completions 兼容服务）。选 `custom` 时可配置接口地址、API Key、模型名、温度、额外请求参数（JSON）、重试次数、超时时间、重试间隔；新增 `llm_client.py` 承载调用与重试。
+
+### 细节
+
+- 新增分节 `[text_template]`（原 `report.template`）、`[llm_rewrite]`（原 `report.llm_task_name` / `use_persona` / `persona_template` / `persona_extra` / `llm_prompt`）；`[report]` 只保留 `enabled` / `schedule_times` / `platform` / `target_groups` / `target_users` / `send_mode`。**旧值不会自动迁移，升级后需在两个新分节重新填写。**
+- `[command]` 的 `use_image` 移除，改为 `send_mode`；`[report]` 的 `mode` + `send_image` 移除，改为 `send_mode`。默认值 `image`，与旧默认行为（发图片、失败回退文字）等价。
+- 自定义服务调用：地址会去掉尾部 `/` 后拼 `/chat/completions`；`api_key` 留空则不发送 `Authorization` 头（便于本地免鉴权服务）；`extra_body` 与默认参数合并，同名时以 `extra_body` 为准，格式非法只记 warning 并忽略。
+- 重试策略：网络异常与 5xx / `429` / `408` / `409` / `425` 会按「重试次数」与「重试间隔」重试；其余 4xx（鉴权、参数错误）直接失败不重试，避免无效请求打爆对方。每次重试记一条 warning，最终失败记一条 error 并回退模板文本。
+- 响应解析兼容三种形态：`choices[0].message.content` 为字符串、为内容片段数组（多模态 / 推理模型）、旧式 `choices[0].text`。
+- 新增 `llm_client.py`；`text_report.py` 移除 `build_report_text`（改为按 `send_mode` 分发），`plugin.py` 新增 `_build_delivery` 统一指令与定时播报的发送路径（移除 `_text_for_delivery`）。
+- `config_version` 递增至 `1.10.0`。
+
+## [1.9.0]
+
+### 主要功能
+
+- 权限拆成**两组互相独立**的配置：`[llm_tool_permission]` 管 LLM 工具 `query_token_usage`，`[command_permission]` 管 `/token` 指令；改一组不影响另一组。
+- 每组都含三层：**对话流黑白名单**（`whitelist` / `blacklist`，默认 `whitelist`）→ **全局默认可查询范围 / 可查询窗口**（各用一组布尔开关，可点选）→ **每对话范围覆盖**（`scope_overrides`，格式 `聊天流类型|号码|可查询范围|可查询窗口`，例如 `群聊|123456|当前对话,全部会话|今日,本周`）。
+- 新增「**可查询窗口**」维度：此前无法限制「能查哪个时间段」，现在每组都能限制到具体窗口（今日 / 本周 / 本月 / 最近 24 / 7×24 / 30×24 小时，以及「全部窗口」）。
+- 新增 `permissions.py`：两组权限的解析与判定（纯函数、不依赖宿主 SDK），`plugin.py` 的两条回调各自调用。
+
+### 细节
+
+- 移除 `[command]` 的 `permission_mode`、`whitelist_groups`、`whitelist_users`、`blacklist_groups`、`blacklist_users`、`tool_allowed_scopes`；`[command]` 只保留 `enabled` / `notify_no_permission` / `deny_message` / `use_image`。**旧权限值不会自动迁移，升级后需在两个新分节重新填写。**
+- `permission_mode` 由 `all` / `whitelist` / `blacklist` 三档收敛为 `whitelist` / `blacklist` 两档（原 `all` ≡ `blacklist` + 名单留空，能力不丢）。
+- 默认值保持不变式：LLM 工具仍只放行「当前对话」（等价旧 `tool_allowed_scopes = ["current"]`），`/token` 指令四范围与七窗口默认全放行（等价旧「指令无范围限制」）。
+- 用户白名单语义明确为「只绕开对话流名单」：命中白名单的用户仍受该对话的范围 / 窗口放行列表约束。
+- 指令被范围 / 窗口拦下时统一回复 `deny_message`，精确原因记 `info` 日志；工具被拦下时返回失败结果并记 `info` 日志（含请求值与本对话实际放行的值）。
+- 覆盖项解析对非法条目（段数不对、类型不认识、号码为空）整条跳过并记 `warning`；段内取值写错只忽略该取值并记 `warning`；重复对话后一条覆盖前一条。
+- `config_version` 递增至 `1.9.0`。
+
+## [1.8.6]
+
+### 细节
+
+- 修复图片报告条形图横轴标签重叠：横轴抽稀此前按「标签个数」取步长（`len(labels) // 12`），标签数在 12~23 个时整除结果恒为 1，等于不抽稀——「今日 / 本周」这类按小时聚合的单窗口报告会画出 15~23 个 `10-08 20:00` 形式的标签，间距仅约 40px 而标签本身约 55px 宽，互相重叠无法辨认。现改为按最长标签的估算像素宽度反推最多可画几个，再据此取步长，保证间距不小于标签宽度；按天/按月的图（标签本来就宽裕）密度维持不变。
+
 ## [1.8.5]
 
 ### 细节
