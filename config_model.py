@@ -381,10 +381,8 @@ class ReportSection(PluginConfigBase):
     )
 
 
-
-
 class CommandSection(PluginConfigBase):
-    """``/token`` 指令的行为开关（权限见「指令查询权限」分节）。"""
+    """``/token`` 指令（``/tokens`` 等效）的行为开关（权限见「指令查询权限」分节）。"""
 
     __ui_label__ = "统计指令"
     __ui_icon__ = "terminal"
@@ -393,7 +391,7 @@ class CommandSection(PluginConfigBase):
     enabled: bool = Field(
         default=True,
         description="关闭后 /token 与 /tokens 不再响应（机器人的其他功能不受影响）",
-        json_schema_extra={"label": "启用指令", "hint": "关闭后 /token 与 /tokens 不再响应，其他功能不受影响"},
+        json_schema_extra={"label": "启用指令", "hint": "关闭后 /token 与 /tokens 都不再响应（两者等效），其他功能不受影响"},
     )
     notify_no_permission: bool = Field(
         default=True,
@@ -548,7 +546,7 @@ class ToolPermissionSection(PluginConfigBase):
 
 
 class CommandPermissionSection(PluginConfigBase):
-    """第二组权限：``/token`` 指令的查询权限。
+    """第二组权限：``/token`` 指令（``/tokens`` 等效）的查询权限。
 
     与「LLM 工具查询权限」完全独立：这里改的是人在群里敲 ``/token`` 的权限，
     不影响模型通过工具查数据，反之亦然。

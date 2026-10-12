@@ -2,7 +2,7 @@
 
 提供三块能力：
 1. ``query_token_usage`` 工具：供 LLM 查询全局或会话维度的 Token 消耗；
-2. ``/token`` 指令：在指令来源处回复统计结果（支持 all / 群 / 用户）；
+2. ``/token`` 指令（``/tokens`` 等效）：在指令来源处回复统计结果（支持 all / 群 / 用户）；
 3. 每日定时播报：按配置时刻向指定 QQ 群 / QQ 号推送统计报告。
 """
 
@@ -40,7 +40,7 @@ from .text_report import build_short_window_text, render_llm_report, render_text
 logger = logging.getLogger(__name__)
 
 _USAGE_TEXT = (
-    "用法：/token [范围] [时间]\n"
+    "用法：/token [范围] [时间]（/tokens 等效）\n"
     "范围：留空=当前对话，all=全部会话，群 <群号>，用户 <QQ号>\n"
     f"时间：留空=全部窗口，可填 {WINDOW_USAGE_HINT}\n"
     "示例：/token、/token 今日、/token all 本周、/token 群 123456 最近7天、/token 用户 10001 30天"
@@ -259,7 +259,7 @@ class TokenUsageReportPlugin(MaiBotPlugin):
 
     @Command(
         "token_usage",
-        description="统计 Bot 的模型用量消耗（可指定范围与时间，例如 /token all 今日、/token 群 123456 本周）",
+        description="统计 Bot 的模型用量消耗（/token 与 /tokens 等效；可指定范围与时间，例如 /token all 今日、/token 群 123456 本周）",
         pattern=(
             r"^/(?:token|tokens)"
             r"(?:\s+(?P<arg1>\S+))?"
@@ -275,7 +275,7 @@ class TokenUsageReportPlugin(MaiBotPlugin):
         is_local_operator: bool = False,
         **kwargs: Any,
     ) -> Tuple[bool, str, bool]:
-        """处理 ``/token`` 指令。"""
+        """处理 ``/token`` 指令（``/tokens`` 等效）。"""
 
         if not self.config.command.enabled:
             return False, "统计指令已禁用", True
@@ -366,7 +366,7 @@ class TokenUsageReportPlugin(MaiBotPlugin):
 
         参数顺序不限，时间窗口可与范围参数混用，例如：``/token``、
         ``/token all``、``/token 今日``、``/token all 今日``、
-        ``/token 群 123456 本周``、``/token 用户 10001 7天``。
+        ``/token 群 123456 本周``、``/token 用户 10001 7天``（``/tokens`` 等效）。
         ``群`` / ``用户`` 后面的第一个参数一律当作目标值，不会被误判成时间窗口。
         """
 
