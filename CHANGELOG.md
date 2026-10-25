@@ -2,6 +2,13 @@
 
 本文件记录 `cssqy.token-usage-report` 的版本变更。每版分为**主要功能**（用户可感知的新能力）与**细节**（修复、行为调整、插件 SDK / API 适配）两部分，一条一行。
 
+## [1.10.2]
+
+### 细节
+
+- 适配最新宿主 / 插件 SDK 的发送返回值：`ctx.send.text` / `ctx.send.image` 现在直接返回布尔值（SDK 在 `return_details=False` 时已把 `send.*` 结果解包），不再返回 `{"success": ...}`。此前 `_extract_send_outcome` 强制要求 `success` 字段，每次发送都会抛 `ValueError` 并被 `send_report` 记成发送失败——`/token` 因此回复「统计结果发送失败」，定时播报也会把全部目标计为失败。现改为直接按布尔值判断，失败时仍记一条 warning。
+- 无配置变更：`config_version` 保持 `1.10.0`，旧配置可直接继续使用。
+
 ## [1.10.1]
 
 ### 细节

@@ -114,11 +114,8 @@ def _extract_stream_id(payload: Any) -> str:
 def _extract_send_outcome(payload: Any) -> Tuple[bool, str]:
     """解析宿主发送能力的返回值，返回 ``(是否成功, 失败原因)``。
 
-    宿主的 ``send.*`` 能力在发送失败时**不抛异常**，而是返回 ``{"success": False, "error": ...}``
-    （见宿主 ``_build_send_result``），外层再由能力服务包一层 ``success=True`` 的传输信封。
-    SDK 交给插件的是内层结果，因此必须读 ``success`` 字段：``bool(payload)`` 对失败字典
-    同样为 True，会把发送失败误判成成功，导致播报静默丢消息而日志显示一切正常。
-
+    最新版插件 SDK 会把 ``send.*`` 能力的结果解包为布尔值（``return_details=False`` 时），
+    失败时不再返回 ``{"success": False, "error": ...}``；因此这里必须按布尔值判断。
     返回结构不符合预期时直接报错，不用兜底把契约变化掩盖成「发送成功」。
 
     Args:
@@ -128,14 +125,14 @@ def _extract_send_outcome(payload: Any) -> Tuple[bool, str]:
         Tuple[bool, str]: 是否发送成功，以及失败原因（成功时为空串）。
 
     Raises:
-        ValueError: 返回值不是带 ``success`` 字段的字典时抛出。
+        ValueError: 返回值不是布尔值时抛出。
     """
 
-    if not isinstance(payload, dict) or "success" not in payload:
+    if not isinstance(payload, bool):
         raise ValueError(f"宿主发送能力返回结构异常：{type(payload).__name__}")
-    if payload.get("success"):
+    if payload:
         return True, ""
-    return False, str(payload.get("error") or "宿主未给出失败原因")
+    return False, "宿主发送能力返回失败"
 
 
 async def send_report(
