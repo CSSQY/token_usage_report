@@ -61,6 +61,44 @@ class TokenUsageReportPlugin(MaiBotPlugin):
         self._reload_event: Optional[asyncio.Event] = None
         self._logged_invalid_times: set[str] = set()
 
+    # ──── WebUI 配置页 ────
+
+    def get_webui_config_schema(self, **kwargs: Any) -> Dict[str, Any]:
+        """在默认 schema 基础上把配置节组织成标签页，避免一屏堆叠。"""
+
+        try:
+            schema = super().get_webui_config_schema(**kwargs)
+        except Exception as exc:  # 配置页绝不能 500
+            logger.warning("[token_usage_report] 构建配置页 schema 失败：%s", exc)
+            return {}
+        if not (isinstance(schema, dict) and isinstance(schema.get("sections"), dict)):
+            return schema
+
+        sections = schema["sections"]
+        groups: List[Tuple[str, str, str, int, List[str]]] = [
+            ("basic", "基础", "settings", 1, ["plugin", "token_unit", "model_aliases"]),
+            ("content", "内容与转述", "file-text", 2, ["text_template", "llm_rewrite"]),
+            ("delivery", "播报与指令", "clock", 3, ["report", "command"]),
+            ("access", "权限", "shield", 4, ["llm_tool_permission", "command_permission"]),
+            ("render", "图片渲染", "image", 5, ["render"]),
+            ("charts", "图表与分组", "bar-chart", 6, ["chart", "module_groups"]),
+            ("limits", "读取上限", "gauge", 7, ["limits"]),
+        ]
+        tabs = [
+            {
+                "id": tab_id,
+                "title": title,
+                "icon": icon,
+                "order": order,
+                "sections": [name for name in section_names if name in sections],
+            }
+            for tab_id, title, icon, order, section_names in groups
+        ]
+        tabs = [tab for tab in tabs if tab["sections"]]
+        if tabs:
+            schema["layout"] = {"type": "tabs", "tabs": tabs}
+        return schema
+
     # ──── 生命周期 ────
 
     async def on_load(self) -> None:

@@ -1,11 +1,11 @@
 """图片报告模板：4 套内置风格与纯内联 SVG 图表。
 
-图表不依赖任何前端库或 CDN，唯一的外部资源是按配置注入的字体服务地址。
+图表不依赖任何前端库或 CDN；外部字体只有在开启并配置了字体服务时才会注入。
 """
 
 from dataclasses import dataclass
 from html import escape as _escape
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import logging
 import math
@@ -42,6 +42,14 @@ _PALETTE: Tuple[str, ...] = (
 
 _HEX_COLOR_PATTERN = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
+_SYSTEM_SANS_FONT_STACK = (
+    "'Noto Sans SC', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', "
+    "'WenQuanYi Micro Hei', sans-serif"
+)
+_SYSTEM_SERIF_FONT_STACK = (
+    "'Noto Serif SC', 'Songti SC', 'SimSun', 'Source Han Serif SC', serif"
+)
+
 _THEMES: Dict[str, Dict[str, str]] = {
     "simple": {
         "page_bg": "#f5f7fb",
@@ -50,7 +58,7 @@ _THEMES: Dict[str, Dict[str, str]] = {
         "muted": "#6b7280",
         "accent": "#4F8CF6",
         "border": "#e5e7eb",
-        "font": "'Noto Sans SC', 'Microsoft YaHei', sans-serif",
+        "font": _SYSTEM_SANS_FONT_STACK,
         "radius": "16px",
     },
     "dark": {
@@ -60,7 +68,7 @@ _THEMES: Dict[str, Dict[str, str]] = {
         "muted": "#93a4bf",
         "accent": "#5ea0ff",
         "border": "#233149",
-        "font": "'Noto Sans SC', 'Microsoft YaHei', sans-serif",
+        "font": _SYSTEM_SANS_FONT_STACK,
         "radius": "18px",
     },
     "handbook": {
@@ -70,7 +78,7 @@ _THEMES: Dict[str, Dict[str, str]] = {
         "muted": "#8c7b6b",
         "accent": "#c1743f",
         "border": "#e6d8bf",
-        "font": "'Noto Serif SC', 'Songti SC', serif",
+        "font": _SYSTEM_SERIF_FONT_STACK,
         "radius": "10px",
     },
     "rank": {
@@ -80,7 +88,7 @@ _THEMES: Dict[str, Dict[str, str]] = {
         "muted": "#9aa5b1",
         "accent": "#f2c14e",
         "border": "#2b333d",
-        "font": "'Noto Sans SC', 'Microsoft YaHei', sans-serif",
+        "font": _SYSTEM_SANS_FONT_STACK,
         "radius": "6px",
     },
 }
@@ -239,13 +247,17 @@ def list_available_templates(config: TokenUsageReportConfig) -> List[str]:
     return [*_THEMES, *parse_custom_templates(config.render.custom_templates)]
 
 
-def build_html(metrics: ReportMetrics, config: TokenUsageReportConfig, font_service: FontService) -> str:
+def build_html(
+    metrics: ReportMetrics,
+    config: TokenUsageReportConfig,
+    font_service: Optional[FontService],
+) -> str:
     """生成完整的报告 HTML。
 
     Args:
         metrics: 指标快照。
         config: 插件配置。
-        font_service: 本次使用的字体服务组。
+        font_service: 本次使用的字体服务组；为 ``None`` 时不加载外部字体，只用系统字体。
 
     Returns:
         str: 可直接交给宿主渲染的 HTML 文本。
@@ -266,12 +278,17 @@ def build_html(metrics: ReportMetrics, config: TokenUsageReportConfig, font_serv
         ]
     )
     body = "\n".join(section for section in sections if section)
+    font_links = ""
+    if font_service is not None:
+        font_links = (
+            f"<link rel=\"preconnect\" href=\"{_escape(font_service.static_base)}\">\n"
+            f"<link href=\"{_escape(font_service.css_base)}/css2?family=Noto+Sans+SC:wght@400;700;900"
+            "&family=Noto+Serif+SC:wght@400;700&display=swap\" rel=\"stylesheet\">\n"
+        )
     return (
         "<!DOCTYPE html>\n"
         "<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n"
-        f"<link rel=\"preconnect\" href=\"{_escape(font_service.static_base)}\">\n"
-        f"<link href=\"{_escape(font_service.css_base)}/css2?family=Noto+Sans+SC:wght@400;700;900"
-        "&family=Noto+Serif+SC:wght@400;700&display=swap\" rel=\"stylesheet\">\n"
+        f"{font_links}"
         f"<style>{_render_style(theme)}</style>\n</head>\n"
         f"<body class=\"theme-{_escape(theme_name)}\">\n<div id=\"report-card\">\n{body}\n</div>\n</body>\n</html>"
     )

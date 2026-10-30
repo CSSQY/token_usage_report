@@ -18,7 +18,7 @@
 - **图片报告**：4 套内置模板（简约白卡片 / 深色数据面板 / 手账便签 / 榜单风），含 **5 个条形图 + 6 个扇形图**与模型用量排行表；每个图表可单独开关。
 - **中文单位**：自动使用 万亿 / 亿 / 万 与 天 / 小时 / 分钟 / 秒。
 - **模型别名**：可配置「内部名=显示名」，统计与图片中一律显示别名。
-- **渲染失败自动回退文字版本**：图片渲染失败时记录一次错误日志并改为发送文字报告。
+- **字体可选、渲染自动回退**：外部字体默认关闭，只用系统字体；开启后外部字体不可用会自动回退系统字体，系统字体也失败时才记录错误日志并改为发送文字报告。
 
 ## 2. 安装与启用
 
@@ -110,11 +110,11 @@
 
 ### 4.0 在 WebUI 里怎么填
 
-插件向 WebUI 提供了完整的配置 Schema，打开插件的配置页即可看到按下面 9 个分节分组的表单（分节顺序即 `__ui_order__`）：
+插件向 WebUI 提供了完整的配置 Schema。配置页已按功能拆成 **7 个标签页**：基础 / 内容与转述 / 播报与指令 / 权限 / 图片渲染 / 图表与分组 / 读取上限，覆盖下面全部 13 个分节；标签内仍按 `__ui_order__` 排列。
 
 | 表单控件 | 出现在哪些字段 | 怎么用 |
 |---|---|---|
-| 开关 | `enabled`、`use_persona`、`anonymize`、`allow_network`、`notify_no_permission`、两组的放行范围/窗口开关、所有图表开关 | 直接切换开/关 |
+| 开关 | `enabled`、`use_persona`、`anonymize`、`use_external_fonts`、`allow_network`、`notify_no_permission`、两组的放行范围/窗口开关、所有图表开关 | 直接切换开/关 |
 | 输入框 | `unit_name`、`platform`、`deny_message`、`api_base_url`、`model`、超时/重试等数值 | 数值项已带步进（如超时 1000 毫秒一步） |
 | 下拉选择 | `llm_rewrite.provider`、`report.send_mode`、`command.send_mode`、`llm_tool_permission.permission_mode`、`command_permission.permission_mode`、`render.template_name`、`render.image_format`、`chart.bar_granularity` | 选项即为配置里的英文/短值，每个值的含义写在字段下方的说明里 |
 | **列表编辑器** | 所有群号/QQ 号列表、模型别名、字体服务组、模块分组前缀、`scope_overrides` | **在输入框填好内容后点右侧「+」按钮添加**（也可按回车），每项显示为一行并带删除按钮 |
@@ -156,7 +156,7 @@
 | `[llm_tool_permission]` | `permission_mode = "whitelist"`、范围默认只有 `当前对话` | **LLM 工具**独立权限：默认只允许名单内的对话用工具，且只能查当前对话 |
 | `[command_permission]` | `permission_mode = "whitelist"`、范围与窗口默认全放行 | **`/token` 指令**独立权限：默认只允许名单内的对话用指令，范围沿用历史行为不加限制 |
 | `[render]` | `anonymize = true` | 报告里的群名/昵称默认匿名化成 `群聊A` / `个人用户A`，避免群里任何人一句 `/token` 就把别的群晒出来 |
-| `[render]` | `template_name = "simple"`、`image_format = "png"`、内置内地+海外两组字体服务 | 联网即可渲染中文；渲染不可用时自动回退文字 |
+| `[render]` | `template_name = "simple"`、`image_format = "png"`、`use_external_fonts = false` | 默认只用系统字体，离线也能出图；需要 Noto 字体效果时再手动开启外部字体 |
 | `[chart]` | 11 个图表开关全为 `true` | 图片报告默认包含 5 条形图 + 6 扇形图 |
 | `[module_groups]` | 已按宿主内置模块名预置 | 无需配置即可得到「计划器/回复器/图片/记忆/表情/插件/其他」分组 |
 | `[limits]` | `max_session_rows = 20000`、`top_models = 20`、`top_modules = 8` | 适配常见数据量；会话明细超上限会明确报错而不是给错数字 |
@@ -168,13 +168,14 @@
 > **升级提示（破坏性变更，旧值均不会自动迁移）**：
 > - `1.8.x → 1.9.0`：`[command]` 的 `permission_mode` / `whitelist_groups` / `whitelist_users` / `blacklist_groups` / `blacklist_users` / `tool_allowed_scopes` 已移除，请到 `[llm_tool_permission]` 与 `[command_permission]` 两个分节重新填写。
 > - `1.9.x → 1.10.0`：`[report]` 的 `mode` / `template` / `llm_task_name` / `use_persona` / `persona_template` / `persona_extra` / `llm_prompt` / `send_image` 与 `[command]` 的 `use_image` 已移除，请到 `[text_template]` / `[llm_rewrite]` 两个新分节以及 `[report].send_mode` / `[command].send_mode` 重新填写。
+> - `1.10.x → 1.11.0`：新增 `[render].use_external_fonts`（默认 `false`，只用系统字体）；如需保持原来的 Noto 字体效果，请手动设为 `true`，并确认 `allow_network = true` 且 `font_services` 在当前网络可访问。
 
 ### 4.1 `[plugin]`
 
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `enabled` | bool | `true` | 是否启用插件 |
-| `config_version` | str | `"1.10.0"` | 配置版本，升级配置结构时递增 |
+| `config_version` | str | `"1.11.0"` | 配置版本，升级配置结构时递增 |
 
 ### 4.2 `[token_unit]`
 
@@ -375,8 +376,9 @@ scope_overrides = [
 | `second_round_timeout_ms` | int | `25000` | 第二轮（回退轮）渲染超时（毫秒） |
 | `viewport_width` / `viewport_height` | int | `1000` / `600` | 第一轮渲染视口 |
 | `fallback_viewport_width` / `fallback_viewport_height` | int | `900` / `1200` | 第二轮（回退轮）渲染视口兜底宽高 |
-| `allow_network` | bool | `true` | 是否允许渲染页面访问外部网络（加载字体 CDN 需要）；**注意**：渲染页面会访问 `font_services` 里的地址，插件只校验其为 `http(s)` 前缀，因此部署者若把它配成 `127.0.0.1` 或内网 / 云元数据地址（如 `169.254.169.254`），渲染页面也会去访问这些地址——配置权在部署者手上、不受聊天输入影响，请自行确认 `font_services` 只填可信的字体服务 |
-| `font_services` | list[str] | 内地 + 海外两组 | 字体服务组，见 4.10.1 |
+| `use_external_fonts` | bool | `false` | 是否使用外部字体：关闭时只用系统字体；开启时优先加载字体服务组，全部不可用时自动回退系统字体 |
+| `allow_network` | bool | `true` | 是否允许渲染页面访问外部网络（仅 `use_external_fonts = true` 时用于加载字体 CDN）；系统字体回退强制不联网。**注意**：渲染页面会访问 `font_services` 里的地址，插件只校验其为 `http(s)` 前缀，因此部署者若把它配成 `127.0.0.1` 或内网 / 云元数据地址（如 `169.254.169.254`），渲染页面也会去访问这些地址——配置权在部署者手上、不受聊天输入影响，请自行确认 `font_services` 只填可信的字体服务 |
+| `font_services` | list[str] | 内地 + 海外两组 | 字体服务组，见 4.10.1；仅在 `use_external_fonts = true` 时生效 |
 | `show_details` | bool | `true` | 是否输出**模型用量排行表**（图片末尾的表格，含 # 名次、Token、调用次数、费用、平均耗时、占比）；文本模板里的 `{details}` 占位符同样受它控制 |
 | `anonymize` | bool | `true` | 是否匿名化聊天对象（**默认开启**）：**聊天消息分布扇形图**与**各聊天流消息数趋势图**里的群名/昵称统一显示为 `群聊A` / `个人用户A`（拿不到会话类型时显示 `会话X`），文字报告与图片报告口径一致；改成 `false` 会显示真实群名/昵称 |
 
@@ -389,8 +391,9 @@ font_services = [
 ]
 ```
 
-- 渲染时按顺序使用第一个服务组；若本轮渲染失败（超时或异常）自动换下一组重试；两组都失败后进入第二轮（兜底视口）再按同样顺序重试。
-- 整条渲染管线有 **45 秒总预算**（常量，防止超出宿主 60 秒组件调用超时）；预算耗尽会直接放弃并回退文字版本。
+- 仅当 `use_external_fonts = true` 且 `allow_network = true` 时才会尝试外部字体：按顺序使用第一个服务组；若本轮渲染失败（超时或异常）自动换下一组重试；两组都失败后进入第二轮（兜底视口）再按同样顺序重试。
+- 外部字体全部失败（或 `use_external_fonts = false` / `allow_network = false`）时，自动用系统字体再渲染一次；系统字体回退强制不联网。只有系统字体也失败才回退文字版本。
+- 整条渲染管线有 **45 秒总预算**（常量，防止超出宿主 60 秒组件调用超时），其中为系统字体回退预留 **15 秒**；外部字体尝试一旦耗尽预留前的 30 秒就会停止，保证兜底仍有机会执行。
 - 条目格式非法（不是 3 段或不是 http(s) 地址）会被跳过并记录一次警告。
 
 > **最低 SDK 版本**：`render.html2png` 的超时参数在 SDK 里由旧版的 `timeout_ms` 改名为 `render_timeout_ms`。插件优先用 `render_timeout_ms` 调用，仅在捕获到 `TypeError` 且异常信息里含 `render_timeout_ms` 时才回退到旧名 `timeout_ms` 重试（[renderer.py](file:///h:/Files/Code/MaiBot%E6%8F%92%E4%BB%B6%E5%BC%80%E5%8F%91/plugins/token_usage_report/renderer.py)）。
@@ -529,9 +532,9 @@ font_services = [
 
 ## 6. 常见问题
 
-- **图片没发出来，只收到文字？** 说明渲染整体失败（字体服务不可用、Playwright 浏览器不可用、超出 45 秒预算等），插件会记录一条 `error` 日志并自动回退文字版本；可检查日志中的「渲染失败（第 N 轮 / 字体服务 …）」定位原因。
+- **图片没发出来，只收到文字？** 说明外部字体与系统字体回退都失败了（如 Playwright 浏览器不可用、超出 45 秒预算等），插件会记录一条 `error` 日志并自动回退文字版本；可检查日志中的「渲染失败（第 N 轮 / 字体服务 …）」与「系统字体（回退）」定位原因。
 - **只收到图片、没有文字？** 这是 `send_mode = "image"` 的预期行为（图片内容已含模板信息，不再重复发文字）。想要文字版就把对应分节的 `send_mode` 改成 `template`（模板文本）或 `llm`（风格化转述）。
-- **字体显示成默认字体？** 检查 `render.allow_network` 是否为 `true`，以及 `font_services` 中的地址在当前网络环境是否可访问。
+- **字体显示成默认字体？** 默认配置 `render.use_external_fonts = false`，只用系统字体；想要 Noto 字体效果请把它改成 `true`，并确认 `render.allow_network = true` 且 `font_services` 地址在当前网络可访问。
 - **数字与 WebUI 统计页面对不上？** 先确认时间窗口口径（WebUI 页面与插件窗口定义可能不同），再确认宿主聚合的最新延迟（约 15 分钟），最后确认上文中「前 50」等上限是否生效。
 - **`/token 群 xxx` 提示找不到会话？** 说明该群尚未与 Bot 产生过聊天流记录；可以让群里先发一条消息，或在配置中改用私聊目标。
 - **Pillow / httpx 需要自己安装吗？** 不需要，宿主已依赖 `pillow>=12.3.0` 与 `httpx[socks]`；插件的 `requirements.txt` 仅供本地开发与静态检查参考（这两项也**没有**写进 `_manifest.json`，避免触发插件的 Python 包冲突检测）。
@@ -589,3 +592,4 @@ font_services = [
 | 1.10.0 | **配置拆分 + 发送方式统一 + 自定义 LLM 服务**：文本呈现从 `[report]` 拆成 `[text_template]`（模板文本）与 `[llm_rewrite]`（转述提示词 / 人格 / 模型来源）两个独立分节；指令与定时播报各新增 `send_mode`（`template` 模板文本 / `llm` LLM 转述 / `image` 图片报告，失败均自动回退模板文本）；`llm_rewrite.provider = "custom"` 可调用任意 [OI] Chat Completions 兼容服务（接口地址 / API Key / 模型 / 温度 / 额外请求参数 / 重试次数 / 超时 / 重试间隔），4xx 中仅 429 等可重试；新增 `llm_client.py`；**破坏性变更**：`report.mode` / `report.template` / `report.llm_*` / `report.send_image` / `command.use_image` 移除且旧值不自动迁移；`config_version` → `1.10.0` |
 | 1.10.1 | 文档：写清**指令词 `/token` 与 `/tokens` 本来就等价**（同一指令的两个写法），此前多处只提 `/token` 易被误读；现统一在用法提示、`@Command` 说明、配置页「启用指令」hint、README §3.1 / §4.7 标注「`/tokens` 等效」，示例表补一行 `/tokens all 今日`。无行为变更 |
 | 1.10.2 | 适配最新宿主 / 插件 SDK 的发送返回值：`ctx.send.text` / `ctx.send.image` 直接返回布尔值，不再返回 `{"success": ...}`；此前按 `success` 字段解析会抛异常并被当成发送失败，导致 `/token` 回复「统计结果发送失败」、定时播报把全部目标计为失败。现改为直接读取布尔结果并保留失败 warning。无配置变更 |
+| 1.11.0 | **外部字体可选 + 渲染回退 + 配置分页**：新增 `render.use_external_fonts`（默认 `false`），关闭时只用系统字体；开启后外部字体全部不可用会自动回退系统字体，系统字体也失败才回退文字。系统字体栈补齐 PingFang SC / 宋体等，渲染预算为系统回退预留 15 秒。WebUI 配置页拆成 7 个标签页（基础 / 内容与转述 / 播报与指令 / 权限 / 图片渲染 / 图表与分组 / 读取上限）；`config_version` → `1.11.0` |

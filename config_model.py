@@ -75,9 +75,9 @@ class PluginSection(PluginConfigBase):
         json_schema_extra={"label": "启用插件", "hint": "关闭后 /token、LLM 工具与定时播报全部停止"},
     )
     config_version: str = Field(
-        default="1.10.0",
+        default="1.11.0",
         description="配置结构版本，由插件维护；升级配置结构时递增，用户一般不需要改动",
-        json_schema_extra={"label": "配置版本", "hint": "插件用它判断是否升级配置结构，一般不用改", "placeholder": "1.10.0"},
+        json_schema_extra={"label": "配置版本", "hint": "插件用它判断是否升级配置结构，一般不用改", "placeholder": "1.11.0"},
     )
 
 
@@ -787,6 +787,14 @@ class RenderSection(PluginConfigBase):
         default=True,
         description="是否允许渲染页面访问外部网络；字体服务地址需要联网，关闭后页面只能用系统字体",
         json_schema_extra={"label": "允许联网渲染", "hint": "字体 CDN 需要联网；关闭后只能用系统字体"},
+    )
+    use_external_fonts: bool = Field(
+        default=False,
+        description="是否使用外部字体服务：关闭时只用系统字体；开启时优先加载字体服务组，全部不可用时自动回退系统字体",
+        json_schema_extra={
+            "label": "使用外部字体",
+            "hint": "默认关闭，避免离线/内网环境因字体 CDN 不可达而拖慢或失败；开启后仍会在字体不可用时自动回退系统字体",
+        },
     )
     font_services: List[str] = Field(
         default=[
