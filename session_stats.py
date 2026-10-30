@@ -279,10 +279,12 @@ class _SessionCollector:
             total_latency_sum += time_cost
 
             if parsed_timestamp is not None:
-                for key, predicate in predicates.items():
-                    if not predicate.contains(parsed_timestamp):
+                # 只遍历本次实际构建的窗口：单窗口统计时 windows 只有 1 个键，
+                # 若按 predicates（恒为全部窗口）遍历会索引到不存在的键并抛 KeyError。
+                for key, window in windows.items():
+                    if not predicates[key].contains(parsed_timestamp):
                         continue
-                    self._accumulate_window(windows[key], tokens, prompt_tokens, completion_tokens, cost)
+                    self._accumulate_window(window, tokens, prompt_tokens, completion_tokens, cost)
                     window_cache_hit[key] += cache_hit
                     window_cache_miss[key] += cache_miss
                     window_latency_sum[key] += time_cost
