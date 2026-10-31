@@ -7,6 +7,8 @@
 ### 细节
 
 - 修复会话维度单窗口统计崩溃：`_fill_metrics` 的聚合循环此前遍历全部 6 个窗口的 `predicates`，但单窗口模式下 `windows` 只构建所选窗口，命中后续窗口时访问 `windows[key]` 抛 `KeyError`（如 `/token 今日` 报 `KeyError: 'this_week'`）。现改为只遍历本次实际构建的 `windows`；全窗口模式行为不变，`/token 今日`、`/token 群 123 本周`、`/token 最近30天` 等会话范围 + 时间窗口恢复。无配置变更。
+- 文档：README §6 与 `requirements.txt` 说明此前写「pillow / httpx 都没有写进 `_manifest.json`」，但清单实际声明了 `pillow>=12.3.0`，排查依赖时会被误读成「插件无任何 Python 包依赖」；现改为准确描述——`_manifest.json` 只声明 `pillow>=12.3.0`（与主程序约束一致），`httpx` 不声明、由宿主提供，缺包时 LLM 转述记一条错误并回退模板文本。无行为变更。
+- 文档：README §8「更新记录」不再内联维护版本表，改为引导读者直接查看 `CHANGELOG.md`；后续版本变更只更新本文件。无行为变更。
 
 ## [1.11.0]
 
