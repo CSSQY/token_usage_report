@@ -537,7 +537,7 @@ font_services = [
 - **字体显示成默认字体？** 默认配置 `render.use_external_fonts = false`，只用系统字体；想要 Noto 字体效果请把它改成 `true`，并确认 `render.allow_network = true` 且 `font_services` 地址在当前网络可访问。
 - **数字与 WebUI 统计页面对不上？** 先确认时间窗口口径（WebUI 页面与插件窗口定义可能不同），再确认宿主聚合的最新延迟（约 15 分钟），最后确认上文中「前 50」等上限是否生效。
 - **`/token 群 xxx` 提示找不到会话？** 说明该群尚未与 Bot 产生过聊天流记录；可以让群里先发一条消息，或在配置中改用私聊目标。
-- **Pillow / httpx 需要自己安装吗？** 不需要，宿主已依赖 `pillow>=12.3.0` 与 `httpx[socks]`；插件的 `requirements.txt` 仅供本地开发与静态检查参考（这两项也**没有**写进 `_manifest.json`，避免触发插件的 Python 包冲突检测）。
+- **Pillow / httpx 需要自己安装吗？** 不需要，宿主已依赖 `pillow>=12.3.0` 与 `httpx[socks]`；插件的 `requirements.txt` 仅供本地开发与静态检查参考。`_manifest.json` 只声明 `pillow>=12.3.0`（与主程序约束一致，宿主依赖流水线会复用已安装版本）；`httpx` **不**声明，由宿主提供，缺包时 LLM 转述会记一条错误并回退模板文本。
 - **怎么让转述更像麦麦？** 把要用的那一路 `send_mode` 设为 `llm`，`llm_rewrite.use_persona` 保持 `true`（会自动读取宿主的 `[personality] personality`、`[personality] reply_style` 与 `[bot] nickname`），`llm_rewrite.provider` 保持 `host` 并让 `llm_task_name` 填你想复用的宿主模型组（例如 `replyer`），必要时再用 `llm_rewrite.persona_extra` 补充额外设定。
 - **想用自己的 API 而不是宿主模型组？** 把 `llm_rewrite.provider` 改成 `custom`，填 `api_base_url`（到 `/v1` 为止）、`api_key`、`model`；温度、额外请求参数、重试次数、超时与重试间隔都可调。调用失败会自动回退模板文本，不会导致报告发不出去。
 - **权限怎么配？** 权限分两组、互不影响：`[llm_tool_permission]` 管模型通过工具查数据，`[command_permission]` 管人敲 `/token`。两组默认都是 `permission_mode = "whitelist"`，把允许的群号填进各自的 `whitelist_groups` 即可（例如 `["111", "222"]`）；想所有对话都能用就改成 `blacklist` 并把名单留空。若要让管理员在任何群里都能用：把管理员 QQ 号填进对应分节的 `whitelist_users`（用户白名单优先于群名单，但仍受范围/窗口放行列表约束）；若只想屏蔽某个群：`permission_mode = "blacklist"` + `blacklist_groups = ["111"]`；若想永久屏蔽某人：`blacklist_users = ["444"]`（最高优先级，两种制度下都生效）。要限制「能查什么范围、什么时间」用两组里的「放行范围 / 放行窗口」开关，要单独给某个群/用户开小灶就用 `scope_overrides`（格式见 4.8.1）。
