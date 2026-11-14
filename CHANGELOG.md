@@ -2,6 +2,13 @@
 
 本文件记录 `cssqy.token-usage-report` 的版本变更。每版分为**主要功能**（用户可感知的新能力）与**细节**（修复、行为调整、插件 SDK / API 适配）两部分，一条一行。
 
+## [1.11.2]
+
+### 细节
+
+- 适配 MaiBot 1.4 系列宿主：`_manifest.json` 的 `host_application.max_version` 由 `1.3.99` 提升到 `1.4.99`，避免在 1.4.x 上以「兼容模式」加载并提示版本不兼容；宿主最低版本仍为 `1.3.0`，SDK 范围不变。已核对 1.4 的 Command / Tool 回调参数、`statistics.local.*`、`database.get`、`send.*` 返回值与本插件用法一致，无需代码改动。
+- 无配置变更：`config_version` 保持 `1.11.0`，旧配置可直接继续使用。
+
 ## [1.11.1]
 
 ### 细节

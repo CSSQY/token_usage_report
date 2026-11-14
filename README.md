@@ -7,7 +7,7 @@
 - 插件 ID：`cssqy.token-usage-report`
 - 仓库：<https://github.com/CSSQY/token_usage_report>
 - 目录：`plugins/token_usage_report/`
-- 宿主版本要求：`1.3.0 ~ 1.3.99`；SDK 要求：`2.9.0 ~ 2.99.99`
+- 宿主版本要求：`1.3.0 ~ 1.4.99`；SDK 要求：`2.9.0 ~ 2.99.99`
 
 ## 1. 功能特性
 
